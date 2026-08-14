@@ -1,0 +1,13 @@
+__pycache__/
+.pytest_cache/
+.venv/
+.runtime/
+*.py[cod]
+*.egg-info/
+*.onnx
+*.pt
+*.pth
+models/*
+!models/.gitkeep
+runs/
+datasets/

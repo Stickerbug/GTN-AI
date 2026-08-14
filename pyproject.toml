@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gtn-ai"
+version = "0.3.0"
+description = "Headless 1v1 AI environment for Garden of Thorn"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+training = ["torch>=2.10"]
+
+[project.scripts]
+gtn-ai-self-play = "gtn_ai.self_play:main"
+gtn-ai-serve = "gtn_ai.inference_server:main"
+gtn-ai-train-linear = "gtn_ai.train_linear:main"
+gtn-ai-train-neural = "gtn_ai.train_neural:main"
+gtn-ai-train-actor-critic = "gtn_ai.train_actor_critic:main"
+gtn-ai-build-structured-cache = "gtn_ai.build_structured_cache:main"
+gtn-ai-build-recorded-teacher-cache = "gtn_ai.build_recorded_teacher_cache:main"
+gtn-ai-train-structured = "gtn_ai.train_structured:main"
+gtn-ai-train-structured-actor-critic = "gtn_ai.train_structured_actor_critic:main"
+gtn-ai-train-correction = "gtn_ai.train_correction:main"
+gtn-ai-arena = "gtn_ai.arena:main"
+gtn-ai-replay-audit = "gtn_ai.replay_audit:main"
+gtn-ai-import-player-data = "gtn_ai.player_data:main"
+gtn-ai-build-experience-prior = "gtn_ai.experience_prior:main"
+gtn-ai-build-deck-prior = "gtn_ai.deck_prior:main"
+gtn-ai-aggregate-replays = "gtn_ai.historical_aggregate:main"
+gtn-ai-validate-loadouts = "gtn_ai.validate_loadouts:main"
+
+[tool.setuptools.packages.find]
+include = ["gtn_ai*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
