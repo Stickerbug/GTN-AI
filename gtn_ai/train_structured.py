@@ -16,6 +16,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("cache", help="Versioned cache directory")
     parser.add_argument("--output", default="models/structured-v2.pt")
     parser.add_argument("--init-checkpoint")
+    parser.add_argument(
+        "--model-state-layers",
+        type=int,
+        help="Override state Transformer depth; an initial checkpoint is expanded safely",
+    )
+    parser.add_argument(
+        "--model-action-layers",
+        type=int,
+        help="Override action Transformer depth; an initial checkpoint is expanded safely",
+    )
     parser.add_argument("--replay-cache", help="Optional broad cache mixed in to prevent forgetting")
     parser.add_argument(
         "--replay-ratio",
@@ -37,6 +47,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--soft-policy-weight", type=float, default=1.0)
     parser.add_argument("--hard-policy-weight", type=float, default=0.1)
     parser.add_argument("--value-loss-weight", type=float, default=0.25)
+    parser.add_argument(
+        "--teacher-margin-weight-power",
+        type=float,
+        default=0.0,
+        help="Upweight decisive teacher labels by their top-two logit margin; 0 disables",
+    )
+    parser.add_argument("--teacher-margin-weight-floor", type=float, default=1.0)
+    parser.add_argument("--teacher-margin-weight-reference", type=float, default=1.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--validation-fraction", type=float, default=0.05)
     parser.add_argument("--device", choices=("auto", "cpu", "xpu", "cuda", "mps"), default="auto")
@@ -57,9 +75,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         soft_policy_weight=args.soft_policy_weight,
         hard_policy_weight=args.hard_policy_weight,
         value_loss_weight=args.value_loss_weight,
+        teacher_margin_weight_power=args.teacher_margin_weight_power,
+        teacher_margin_weight_floor=args.teacher_margin_weight_floor,
+        teacher_margin_weight_reference=args.teacher_margin_weight_reference,
         max_grad_norm=args.max_grad_norm,
         validation_fraction=args.validation_fraction,
         initial_checkpoint=args.init_checkpoint,
+        model_state_layers=args.model_state_layers,
+        model_action_layers=args.model_action_layers,
         replay_cache_dir=args.replay_cache,
         replay_ratio=args.replay_ratio,
         trainable_scope=args.trainable_scope,

@@ -20,6 +20,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--deck-prior",
         help="Optional anonymous population deck prior added to structured inputs",
     )
+    parser.add_argument(
+        "--dynamic-deck-belief",
+        action="store_true",
+        help="Condition deck-prior tokens on public opponent card evidence",
+    )
     parser.add_argument("--output", default="datasets/structured-v2-cache")
     parser.add_argument("--teacher-batch-size", type=int, default=256)
     parser.add_argument("--shard-size", type=int, default=4096)
@@ -45,6 +50,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir=args.output,
         config=config,
         deck_prior_path=args.deck_prior,
+        dynamic_deck_belief=args.dynamic_deck_belief,
         teacher_batch_size=args.teacher_batch_size,
         shard_size=args.shard_size,
         device=args.device,
@@ -75,6 +81,15 @@ def _add_model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--action-layers", type=int, default=defaults.action_layers)
     parser.add_argument("--feedforward-dim", type=int, default=defaults.feedforward_dim)
     parser.add_argument("--dropout", type=float, default=defaults.dropout)
+    parser.add_argument(
+        "--contextual-value-features",
+        action="store_true",
+        default=defaults.contextual_value_features,
+        help=(
+            "Encode card-instance mutations, rule operations, resource demand, "
+            "and deck context without a fixed scalar card value"
+        ),
+    )
 
 
 def _config_from_args(args) -> StructuredModelConfig:
@@ -90,6 +105,7 @@ def _config_from_args(args) -> StructuredModelConfig:
         action_layers=args.action_layers,
         feedforward_dim=args.feedforward_dim,
         dropout=args.dropout,
+        contextual_value_features=args.contextual_value_features,
     )
 
 

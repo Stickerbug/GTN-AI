@@ -371,7 +371,7 @@ def _timeout_fallback_action(observation: dict[str, Any], legal_actions: Sequenc
             return toggles[0]
     pending = observation.get("pending") or {}
     if pending:
-        for kind in ("submit_choice", "default_choice", "select_choice", "append_choice_order"):
+        for kind in ("submit_choice", "default_choice", "select_choice", "append_choice_order", "v2_ui_response"):
             candidates = [action for action in actions if action.kind == kind]
             if candidates:
                 return candidates[0]

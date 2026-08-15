@@ -109,6 +109,8 @@ class HeuristicPolicy:
             if target >= 0:
                 return 23.0 + self._target_score(observation, target)
             return 25.0
+        if kind == "v2_ui_response":
+            return 18.0 if payload.get("button_role") == "cancel" else 27.0
         if kind == "play_card":
             card = _find_card(observation, payload.get("hand_slot"), zone="hand")
             if card is None:
@@ -145,6 +147,21 @@ def policy_from_name(name: str, *, seed: int = 0, exploration: float | None = No
     raw_name = str(name or "heuristic").strip()
     normalized = raw_name.lower()
     for prefix, device in (
+        ("safe-structured-cpu:", "cpu"),
+        ("safe-structured:", "auto"),
+    ):
+        if normalized.startswith(prefix):
+            from .progress_policy import ProgressSafePolicy
+
+            checkpoint_path = raw_name[len(prefix):]
+            base = _cached_structured_template(checkpoint_path, device=device).fork(
+                seed=seed,
+                temperature=0.0,
+                record_behavior=False,
+                name=Path(checkpoint_path).stem,
+            )
+            return ProgressSafePolicy(base)
+    for prefix, device in (
         ("experience-cpu:", "cpu"),
         ("experience:", "auto"),
     ):
@@ -163,6 +180,19 @@ def policy_from_name(name: str, *, seed: int = 0, exploration: float | None = No
             )
             prior = _cached_experience_prior(prior_path)
             return ExperiencePriorPolicy(base, prior, seed=seed)
+    for prefix, device in (
+        ("safe-correction-cpu:", "cpu"),
+        ("safe-correction:", "auto"),
+    ):
+        if normalized.startswith(prefix):
+            from .progress_policy import ProgressSafePolicy
+
+            checkpoint_path = raw_name[len(prefix):]
+            base = _cached_correction_template(checkpoint_path, device=device).fork(
+                seed=seed,
+                name=Path(checkpoint_path).stem,
+            )
+            return ProgressSafePolicy(base)
     for prefix, device in (
         ("correction-cpu:", "cpu"),
         ("correction:", "auto"),
@@ -210,10 +240,12 @@ def policy_from_name(name: str, *, seed: int = 0, exploration: float | None = No
 
         return HashedLinearPolicy.load(raw_name.split(":", 1)[1], seed=seed)
     unsafe_rollout_prefixes = (
-        ("unsafe-rollout-cpu:", "cpu"),
-        ("unsafe-rollout:", "auto"),
+        ("unsafe-rollout-correction-cpu:", "cpu", True),
+        ("unsafe-rollout-correction:", "auto", True),
+        ("unsafe-rollout-cpu:", "cpu", False),
+        ("unsafe-rollout:", "auto", False),
     )
-    for prefix, device in unsafe_rollout_prefixes:
+    for prefix, device, correction_base in unsafe_rollout_prefixes:
         if normalized.startswith(prefix):
             from .rollout_search import (
                 UnsafeFullStateRolloutPolicy,
@@ -221,17 +253,21 @@ def policy_from_name(name: str, *, seed: int = 0, exploration: float | None = No
             )
 
             checkpoint_path, config = parse_unsafe_rollout_spec(raw_name[len(prefix):])
-            template = _cached_structured_template(checkpoint_path, device=device)
+            template = (
+                _cached_correction_template(checkpoint_path, device=device)
+                if correction_base
+                else _cached_structured_template(checkpoint_path, device=device)
+            )
             base = template.fork(
                 seed=seed,
-                temperature=0.0,
-                record_behavior=False,
                 name=f"{Path(checkpoint_path).stem}+search-base",
             )
             return UnsafeFullStateRolloutPolicy(base, config=config, seed=seed)
-    for prefix, device in (
-        ("structured-belief-cpu:", "cpu"),
-        ("structured-belief:", "auto"),
+    for prefix, device, include_public_evidence in (
+        ("structured-dynamic-belief-cpu:", "cpu", True),
+        ("structured-dynamic-belief:", "auto", True),
+        ("structured-belief-cpu:", "cpu", False),
+        ("structured-belief:", "auto", False),
     ):
         if normalized.startswith(prefix):
             from .deck_prior import DeckBeliefPolicy
@@ -251,7 +287,12 @@ def policy_from_name(name: str, *, seed: int = 0, exploration: float | None = No
             return DeckBeliefPolicy(
                 base,
                 _cached_deck_prior(prior_path),
-                name=f"{Path(checkpoint_path).stem}+deck-belief",
+                name=(
+                    f"{Path(checkpoint_path).stem}+dynamic-deck-belief"
+                    if include_public_evidence
+                    else f"{Path(checkpoint_path).stem}+deck-belief"
+                ),
+                include_public_evidence=include_public_evidence,
             )
     structured_prefixes = (
         ("structured-onpolicy-cpu:", "cpu", 0.8, True),

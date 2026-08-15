@@ -1,19 +1,29 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
 from gtn_ai import Garden1v1Env
 from gtn_ai.deck_prior import DeckPrior
-from gtn_ai.neural_model import NeuralModelConfig, NeuralPolicy, VariableActionNetwork, torch_available
+from gtn_ai.neural_model import (
+    NeuralModelConfig,
+    NeuralPolicy,
+    VariableActionNetwork,
+    torch,
+    torch_available,
+)
 from gtn_ai.policies import policy_from_name
 from gtn_ai.structured_cache import (
     build_distillation_cache,
     build_recorded_teacher_cache,
     iter_cached_examples,
 )
-from gtn_ai.structured_distillation import train_structured_distillation
+from gtn_ai.structured_distillation import (
+    _teacher_margin_weights,
+    train_structured_distillation,
+)
 from gtn_ai.structured_features import TokenType, encode_structured_decision
 from gtn_ai.structured_model import (
     StructuredEnsemblePolicy,
@@ -21,6 +31,7 @@ from gtn_ai.structured_model import (
     StructuredPolicy,
     StructuredPolicyNetwork,
     collate_structured_decisions,
+    expand_structured_model,
 )
 
 
@@ -58,6 +69,22 @@ def _teacher_config() -> NeuralModelConfig:
         max_history_tokens_per_event=8,
         dropout=0,
     )
+
+
+def test_teacher_margin_weights_favor_decisive_labels() -> None:
+    logits = torch.tensor([[0.0, -0.1, -2.0], [0.0, -2.0, -3.0]])
+    mask = torch.ones_like(logits, dtype=torch.bool)
+
+    weights = _teacher_margin_weights(
+        logits,
+        mask,
+        power=1.0,
+        floor=0.25,
+        reference=1.0,
+    )
+
+    assert weights[0].item() == pytest.approx(0.325)
+    assert weights[1].item() == pytest.approx(1.0)
 
 
 def test_structured_encoder_keeps_cards_players_and_actions_as_separate_tokens():
@@ -132,6 +159,65 @@ def test_structured_checkpoint_round_trip_selects_only_a_legal_action(tmp_path):
     )
     assert belief_policy.select_action(observation, legal) in legal
     assert belief_policy.diagnostics()["deck_belief_fingerprint"]
+
+
+def test_structured_model_expansion_preserves_initial_outputs() -> None:
+    import torch
+
+    source_config = _structured_config()
+    target_config = StructuredModelConfig(
+        **{
+            **source_config.__dict__,
+            "state_layers": source_config.state_layers + 1,
+            "action_layers": source_config.action_layers + 1,
+        }
+    )
+    source = StructuredPolicyNetwork(source_config)
+    source.eval()
+    expanded, report = expand_structured_model(
+        source,
+        source_config=source_config,
+        target_config=target_config,
+    )
+    expanded.eval()
+    env = Garden1v1Env(enabled_mods=["Vanilla Cards.gtnmod"], seed=1107)
+    observation = env.reset()
+    legal = env.legal_actions(env.decision_player())
+    decision = encode_structured_decision(
+        observation,
+        legal,
+        config=source_config.feature_config,
+    )
+    batch = collate_structured_decisions([decision], config=source_config)
+
+    with torch.no_grad():
+        source_scores, source_values = source(batch)
+        expanded_scores, expanded_values = expanded(batch)
+
+    assert torch.allclose(source_scores, expanded_scores, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(source_values, expanded_values, atol=1e-6, rtol=1e-6)
+    assert report["identity_state_layers"] == 1
+    assert report["identity_action_layers"] == 1
+
+
+def test_structured_model_can_enable_context_features_from_old_weights() -> None:
+    source_config = _structured_config()
+    target_config = StructuredModelConfig(
+        **{
+            **source_config.__dict__,
+            "contextual_value_features": True,
+        }
+    )
+    source = StructuredPolicyNetwork(source_config)
+    expanded, report = expand_structured_model(
+        source,
+        source_config=source_config,
+        target_config=target_config,
+    )
+
+    assert expanded.config.contextual_value_features is True
+    assert report["contextual_value_features_changed"] is True
+    assert set(expanded.state_dict()) == set(source.state_dict())
 
 
 def test_versioned_cache_and_distillation_round_trip(tmp_path):
@@ -212,6 +298,7 @@ def test_recorded_search_teacher_cache_round_trip(tmp_path):
     env = Garden1v1Env(enabled_mods=["Vanilla Cards.gtnmod"], seed=1105)
     observation = env.reset()
     legal = env.legal_actions(env.decision_player())
+    decision_player = env.decision_player()
     selected_index = min(1, len(legal) - 1)
     executed_index = 0
     logits = [-2.0] * len(legal)
@@ -224,7 +311,7 @@ def test_recorded_search_teacher_cache_round_trip(tmp_path):
         "loadout_fingerprint": env.loadout_fingerprint,
         "ruleset_fingerprint": env.ruleset_fingerprint,
         "policies": ["search", "heuristic"],
-        "winner": 0,
+        "winner": decision_player,
         "terminated": True,
         "truncated": False,
         "steps": 1,
@@ -232,11 +319,12 @@ def test_recorded_search_teacher_cache_round_trip(tmp_path):
         "loop_recoveries": 0,
         "decisions": [{
             "step": 0,
-            "player": env.decision_player(),
+            "player": decision_player,
             "observation": observation,
             "legal_actions": [action.to_dict() for action in legal],
             "action": legal[executed_index].to_dict(),
             "forced_fallback": False,
+            "diagnostic": {"hard_example_weight": 2.0},
             "teacher": {
                 "kind": "belief_rollout_v1",
                 "action_key": legal[selected_index].key,
@@ -259,6 +347,7 @@ def test_recorded_search_teacher_cache_round_trip(tmp_path):
         output_dir=cache_dir,
         config=config,
         deck_prior_path=prior_path,
+        dynamic_deck_belief=True,
         shard_size=1,
     )
     examples = list(iter_cached_examples(cache_dir))
@@ -266,12 +355,68 @@ def test_recorded_search_teacher_cache_round_trip(tmp_path):
     assert manifest["source_kind"] == "recorded_offline_teacher"
     assert manifest["teacher_name"] == "belief_rollout_v1"
     assert manifest["deck_prior_fingerprint"] == prior.fingerprint
+    assert manifest["deck_belief_schema_version"] == 2
     assert manifest["counters"]["examples"] == 1
     assert len(examples) == 1
     assert examples[0].teacher_logits == pytest.approx(logits)
     assert examples[0].teacher_value == pytest.approx(0.25)
+    assert examples[0].example_weight == pytest.approx(2.0)
     assert examples[0].decision.selected_index == selected_index
     assert len(examples[0].decision.state_tokens) > baseline_tokens
+    assert manifest["counters"]["teacher_behavior_disagreements"] == int(
+        selected_index != executed_index
+    )
+    assert manifest["counters"]["teacher_behavior_agreements"] == int(
+        selected_index == executed_index
+    )
+
+    contextual_cache = tmp_path / "contextual-search-cache"
+    contextual_manifest = build_recorded_teacher_cache(
+        [trajectory_path],
+        output_dir=contextual_cache,
+        config=replace(config, contextual_value_features=True),
+        shard_size=1,
+    )
+    contextual_example = next(iter_cached_examples(contextual_cache))
+    assert contextual_manifest["paired_base_features"] is True
+    assert contextual_example.base_decision is not None
+    assert contextual_example.example_weight == pytest.approx(2.0)
+    assert contextual_example.base_decision.action_count == len(legal)
+    assert contextual_example.decision.state_tokens != (
+        contextual_example.base_decision.state_tokens
+    )
+
+    disagreement_cache = tmp_path / "teacher-disagreement-cache"
+    disagreement_manifest = build_recorded_teacher_cache(
+        [trajectory_path],
+        output_dir=disagreement_cache,
+        config=config,
+        shard_size=1,
+        only_teacher_disagreements=True,
+    )
+    assert disagreement_manifest["only_teacher_disagreements"] is True
+    assert disagreement_manifest["counters"]["examples"] == 1
+    assert disagreement_manifest["counters"]["decisions_filtered_teacher_agreement"] == 0
+
+    agreeing_trajectory = tmp_path / "search-agreement.jsonl"
+    agreeing_episode = json.loads(trajectory_path.read_text(encoding="utf-8"))
+    agreeing_decision = agreeing_episode["decisions"][0]
+    agreeing_logits = [-2.0] * len(legal)
+    agreeing_logits[executed_index] = 0.0
+    agreeing_decision["teacher"]["action_key"] = legal[executed_index].key
+    agreeing_decision["teacher"]["logits"] = agreeing_logits
+    agreeing_trajectory.write_text(
+        json.dumps(agreeing_episode, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="no recorded teacher decisions"):
+        build_recorded_teacher_cache(
+            [agreeing_trajectory],
+            output_dir=tmp_path / "teacher-agreement-cache",
+            config=config,
+            shard_size=1,
+            only_teacher_disagreements=True,
+        )
 
     with pytest.raises(ValueError, match="no recorded teacher decisions"):
         build_recorded_teacher_cache(
@@ -281,6 +426,52 @@ def test_recorded_search_teacher_cache_round_trip(tmp_path):
             shard_size=1,
             min_teacher_margin=0.2,
         )
+
+    preserved_cache = tmp_path / "winner-preserved-cache"
+    preserved = build_recorded_teacher_cache(
+        [trajectory_path],
+        output_dir=preserved_cache,
+        config=config,
+        shard_size=1,
+        preserve_winner_actions=True,
+    )
+    preserved_example = next(iter_cached_examples(preserved_cache))
+    assert preserved_example.decision.selected_index == executed_index
+    assert max(
+        range(len(preserved_example.teacher_logits)),
+        key=preserved_example.teacher_logits.__getitem__,
+    ) == executed_index
+    assert preserved["counters"]["winner_actions_preserved"] == 1
+    assert preserved["counters"]["winner_teacher_disagreements"] == int(
+        selected_index != executed_index
+    )
+
+    losing_trajectory = tmp_path / "search-loss.jsonl"
+    losing_episode = json.loads(trajectory_path.read_text(encoding="utf-8"))
+    losing_episode["winner"] = 1 - decision_player
+    losing_trajectory.write_text(
+        json.dumps(losing_episode, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    corrected_cache = tmp_path / "loser-corrected-cache"
+    corrected = build_recorded_teacher_cache(
+        [losing_trajectory],
+        output_dir=corrected_cache,
+        config=config,
+        shard_size=1,
+        preserve_winner_actions=True,
+    )
+    corrected_example = next(iter_cached_examples(corrected_cache))
+    assert corrected_example.decision.selected_index == selected_index
+    assert corrected_example.teacher_logits == pytest.approx(logits)
+    assert corrected["counters"]["loser_teacher_actions"] == 1
+
+    shard_path = next(cache_dir.glob("shard-*.pt"))
+    shard = torch.load(shard_path, map_location="cpu", weights_only=False)
+    shard.pop("example_weights")
+    torch.save(shard, shard_path)
+    legacy_example = next(iter_cached_examples(cache_dir))
+    assert legacy_example.example_weight == pytest.approx(1.0)
 
 
 def test_cache_split_is_stable_when_shards_are_shuffled(tmp_path):

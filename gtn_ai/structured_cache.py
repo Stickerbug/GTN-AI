@@ -5,7 +5,7 @@ import json
 import math
 import random
 import shutil
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
@@ -39,6 +39,35 @@ class StructuredDistillationExample:
     decision: StructuredDecision
     teacher_logits: tuple[float, ...]
     teacher_value: float
+    base_decision: StructuredDecision | None = None
+    example_weight: float = 1.0
+
+
+def _encode_paired_decisions(
+    observation: dict[str, Any],
+    legal: Sequence[Action],
+    *,
+    config: StructuredModelConfig,
+    selected_index: int,
+) -> tuple[StructuredDecision, StructuredDecision | None]:
+    """Encode context-rich and legacy views of one decision when requested."""
+
+    decision = encode_structured_decision(
+        observation,
+        legal,
+        config=config.feature_config,
+        selected_index=selected_index,
+    )
+    if not config.contextual_value_features:
+        return decision, None
+    base_config = replace(config, contextual_value_features=False)
+    base_decision = encode_structured_decision(
+        observation,
+        legal,
+        config=base_config.feature_config,
+        selected_index=selected_index,
+    )
+    return decision, base_decision
 
 
 def build_distillation_cache(
@@ -48,6 +77,7 @@ def build_distillation_cache(
     output_dir: str | Path,
     config: StructuredModelConfig,
     deck_prior_path: str | Path | None = None,
+    dynamic_deck_belief: bool = False,
     teacher_batch_size: int = 256,
     shard_size: int = 4096,
     device: str = "auto",
@@ -72,6 +102,9 @@ def build_distillation_cache(
     teacher_fingerprint = neural_state_dict_fingerprint(teacher["model"].state_dict())
     teacher["model"].eval()
     deck_prior = _load_deck_prior(deck_prior_path)
+    deck_belief_schema_version = _deck_belief_schema_version(
+        deck_prior, dynamic=dynamic_deck_belief
+    )
 
     source_identity = [_file_identity(path) for path in source_paths]
     cache_identity = {
@@ -84,7 +117,9 @@ def build_distillation_cache(
         "deck_prior_fingerprint": (
             deck_prior.fingerprint if deck_prior is not None else None
         ),
+        "deck_belief_schema_version": deck_belief_schema_version,
         "structured_config": asdict(config),
+        "paired_base_features": bool(config.contextual_value_features),
         "sources": source_identity,
         "skip_recovered_episodes": bool(skip_recovered_episodes),
         "max_decisions": max(0, int(max_decisions)),
@@ -92,7 +127,9 @@ def build_distillation_cache(
     cache_fingerprint = _json_fingerprint(cache_identity)
 
     pending_teacher = []
-    pending_structured: list[StructuredDecision] = []
+    pending_structured: list[
+        tuple[StructuredDecision, StructuredDecision | None]
+    ] = []
     shard_buffer: list[StructuredDistillationExample] = []
     shard_records: list[dict[str, Any]] = []
     rulesets: set[str] = set()
@@ -126,7 +163,7 @@ def build_distillation_cache(
         offsets = batch["action_set_offsets"].detach().to("cpu").tolist()
         scores_cpu = scores.detach().to("cpu")
         values_cpu = values.detach().to("cpu").tolist()
-        for row, structured in enumerate(pending_structured):
+        for row, (structured, base_structured) in enumerate(pending_structured):
             start, end = int(offsets[row]), int(offsets[row + 1])
             logits = scores_cpu[start:end]
             logits = logits - logits.max()
@@ -134,6 +171,7 @@ def build_distillation_cache(
                 decision=structured,
                 teacher_logits=tuple(float(value) for value in logits.tolist()),
                 teacher_value=float(values_cpu[row]),
+                base_decision=base_structured,
             ))
         pending_teacher.clear()
         pending_structured.clear()
@@ -176,12 +214,12 @@ def build_distillation_cache(
                     if action.key == selected.key
                 )
                 structured_observation = _augment_with_deck_prior(
-                    observation, deck_prior
+                    observation, deck_prior, dynamic=dynamic_deck_belief
                 )
-                structured = encode_structured_decision(
+                structured, base_structured = _encode_paired_decisions(
                     structured_observation,
                     legal,
-                    config=config.feature_config,
+                    config=config,
                     selected_index=selected_index,
                 )
                 teacher_encoded = encode_decision(
@@ -193,7 +231,7 @@ def build_distillation_cache(
             except (KeyError, StopIteration, TypeError, ValueError):
                 counters["invalid_decisions"] += 1
                 continue
-            pending_structured.append(structured)
+            pending_structured.append((structured, base_structured))
             pending_teacher.append(teacher_encoded)
             counters["examples"] += 1
             if len(pending_teacher) >= max(1, int(teacher_batch_size)):
@@ -243,11 +281,14 @@ def build_recorded_teacher_cache(
     output_dir: str | Path,
     config: StructuredModelConfig,
     deck_prior_path: str | Path | None = None,
+    dynamic_deck_belief: bool = False,
     shard_size: int = 4096,
     max_decisions: int = 0,
     expected_decisions: int = 0,
     skip_recovered_episodes: bool = True,
     min_teacher_margin: float = 0.0,
+    only_teacher_disagreements: bool = False,
+    preserve_winner_actions: bool = False,
     overwrite: bool = False,
     progress_interval: float = 10.0,
     show_progress: bool = True,
@@ -266,6 +307,9 @@ def build_recorded_teacher_cache(
     source_identity = [_file_identity(path) for path in source_paths]
     minimum_margin = max(0.0, float(min_teacher_margin))
     deck_prior = _load_deck_prior(deck_prior_path)
+    deck_belief_schema_version = _deck_belief_schema_version(
+        deck_prior, dynamic=dynamic_deck_belief
+    )
     cache_identity = {
         "cache_schema_version": DISTILLATION_CACHE_SCHEMA_VERSION,
         "structured_feature_schema_version": STRUCTURED_FEATURE_SCHEMA_VERSION,
@@ -276,11 +320,15 @@ def build_recorded_teacher_cache(
         "deck_prior_fingerprint": (
             deck_prior.fingerprint if deck_prior is not None else None
         ),
+        "deck_belief_schema_version": deck_belief_schema_version,
         "structured_config": asdict(config),
+        "paired_base_features": bool(config.contextual_value_features),
         "sources": source_identity,
         "skip_recovered_episodes": bool(skip_recovered_episodes),
         "max_decisions": max(0, int(max_decisions)),
         "min_teacher_margin": minimum_margin,
+        "only_teacher_disagreements": bool(only_teacher_disagreements),
+        "preserve_winner_actions": bool(preserve_winner_actions),
     }
     cache_fingerprint = _json_fingerprint(cache_identity)
     shard_buffer: list[StructuredDistillationExample] = []
@@ -297,6 +345,14 @@ def build_recorded_teacher_cache(
         "invalid_decisions": 0,
         "decisions_missing_teacher_margin": 0,
         "decisions_below_teacher_margin": 0,
+        "teacher_behavior_agreements": 0,
+        "teacher_behavior_disagreements": 0,
+        "decisions_filtered_teacher_agreement": 0,
+        "winner_actions_preserved": 0,
+        "winner_teacher_disagreements": 0,
+        "winner_teacher_actions": 0,
+        "loser_teacher_actions": 0,
+        "draw_teacher_actions": 0,
         "examples": 0,
     }
     progress = ProgressReporter(
@@ -328,6 +384,7 @@ def build_recorded_teacher_cache(
         if ruleset:
             rulesets.add(ruleset)
         counters["episodes_used"] += 1
+        winner = _as_int(episode.get("winner"), -1)
         for decision in episode.get("decisions") or []:
             counters["decisions_seen"] += 1
             teacher = decision.get("teacher")
@@ -342,9 +399,9 @@ def build_recorded_teacher_cache(
                     Action.from_dict(item)
                     for item in decision.get("legal_actions") or []
                 ]
-                Action.from_dict(decision.get("action") or {})
+                executed_action = Action.from_dict(decision.get("action") or {})
                 teacher_action_key = str(teacher.get("action_key") or "")
-                selected_index = next(
+                teacher_index = next(
                     index for index, action in enumerate(legal)
                     if action.key == teacher_action_key
                 )
@@ -354,9 +411,21 @@ def build_recorded_teacher_cache(
                     raise ValueError("teacher logits do not match legal actions")
                 if not all(math.isfinite(item) for item in (*logits, value)):
                     raise ValueError("teacher output contains non-finite values")
-                teacher_index = max(range(len(logits)), key=logits.__getitem__)
-                if teacher_index != selected_index:
+                teacher_argmax = max(range(len(logits)), key=logits.__getitem__)
+                if teacher_argmax != teacher_index:
                     raise ValueError("teacher argmax does not match recorded action")
+                executed_index = next(
+                    index for index, action in enumerate(legal)
+                    if action.key == executed_action.key
+                )
+                teacher_disagrees = teacher_index != executed_index
+                if teacher_disagrees:
+                    counters["teacher_behavior_disagreements"] += 1
+                else:
+                    counters["teacher_behavior_agreements"] += 1
+                    if only_teacher_disagreements:
+                        counters["decisions_filtered_teacher_agreement"] += 1
+                        continue
                 kind = str(teacher.get("kind") or "").strip()
                 if not kind:
                     raise ValueError("teacher kind is missing")
@@ -371,15 +440,47 @@ def build_recorded_teacher_cache(
                     if margin < minimum_margin:
                         counters["decisions_below_teacher_margin"] += 1
                         continue
-                structured_observation = _augment_with_deck_prior(
-                    observation, deck_prior
+                decision_player = _as_int(decision.get("player"), -1)
+                preserve_action = (
+                    bool(preserve_winner_actions)
+                    and winner in (0, 1)
+                    and decision_player == winner
                 )
-                structured = encode_structured_decision(
+                if preserve_action:
+                    selected_index = executed_index
+                    counters["winner_actions_preserved"] += 1
+                    if selected_index != teacher_index:
+                        counters["winner_teacher_disagreements"] += 1
+                        logits = tuple(
+                            0.0 if index == selected_index else -4.0
+                            for index in range(len(legal))
+                        )
+                else:
+                    selected_index = teacher_index
+                    if winner not in (0, 1):
+                        counters["draw_teacher_actions"] += 1
+                    elif decision_player == winner:
+                        counters["winner_teacher_actions"] += 1
+                    else:
+                        counters["loser_teacher_actions"] += 1
+                structured_observation = _augment_with_deck_prior(
+                    observation, deck_prior, dynamic=dynamic_deck_belief
+                )
+                structured, base_structured = _encode_paired_decisions(
                     structured_observation,
                     legal,
-                    config=config.feature_config,
+                    config=config,
                     selected_index=selected_index,
                 )
+                diagnostic = decision.get("diagnostic")
+                example_weight = float(
+                    (diagnostic or {}).get("hard_example_weight", 1.0)
+                    if isinstance(diagnostic, dict)
+                    else 1.0
+                )
+                if not math.isfinite(example_weight) or example_weight <= 0.0:
+                    raise ValueError("hard-example weight must be finite and positive")
+                example_weight = min(10.0, example_weight)
             except (KeyError, StopIteration, TypeError, ValueError):
                 counters["invalid_decisions"] += 1
                 continue
@@ -388,6 +489,8 @@ def build_recorded_teacher_cache(
                 decision=structured,
                 teacher_logits=logits,
                 teacher_value=max(-1.0, min(1.0, value)),
+                base_decision=base_structured,
+                example_weight=example_weight,
             ))
             counters["examples"] += 1
             flush_full_shards()
@@ -441,12 +544,26 @@ def _load_deck_prior(path: str | Path | None):
     return DeckPrior.load(path)
 
 
-def _augment_with_deck_prior(observation: dict[str, Any], prior):
+def _deck_belief_schema_version(prior, *, dynamic: bool) -> int | None:
+    if prior is None or not dynamic:
+        return None
+    from .deck_prior import DECK_BELIEF_FEATURE_SCHEMA_VERSION
+
+    return int(DECK_BELIEF_FEATURE_SCHEMA_VERSION)
+
+
+def _augment_with_deck_prior(
+    observation: dict[str, Any], prior, *, dynamic: bool = False
+):
     if prior is None:
         return observation
     from .deck_prior import augment_observation_with_deck_prior
 
-    return augment_observation_with_deck_prior(observation, prior)
+    return augment_observation_with_deck_prior(
+        observation,
+        prior,
+        include_public_evidence=dynamic,
+    )
 
 
 def load_cache_manifest(path: str | Path) -> dict[str, Any]:
@@ -585,10 +702,21 @@ def _write_shard(
     *,
     config: StructuredModelConfig,
 ) -> dict[str, Any]:
+    paired_base_features = any(
+        example.base_decision is not None for example in examples
+    )
+    if paired_base_features and any(
+        example.base_decision is None for example in examples
+    ):
+        raise ValueError("a cache shard cannot mix paired and unpaired features")
     state_tokens: list[EntityToken] = []
     action_tokens: list[EntityToken] = []
     state_offsets = [0]
     action_offsets = [0]
+    base_state_tokens: list[EntityToken] = []
+    base_action_tokens: list[EntityToken] = []
+    base_state_offsets = [0]
+    base_action_offsets = [0]
     teacher_logits: list[float] = []
     action_biases: list[float] = []
     for example in examples:
@@ -596,6 +724,11 @@ def _write_shard(
         action_tokens.extend(example.decision.action_tokens)
         state_offsets.append(len(state_tokens))
         action_offsets.append(len(action_tokens))
+        if example.base_decision is not None:
+            base_state_tokens.extend(example.base_decision.state_tokens)
+            base_action_tokens.extend(example.base_decision.action_tokens)
+            base_state_offsets.append(len(base_state_tokens))
+            base_action_offsets.append(len(base_action_tokens))
         teacher_logits.extend(example.teacher_logits)
         biases = example.decision.action_logit_biases or (
             0.0,
@@ -610,6 +743,9 @@ def _write_shard(
         "teacher_values": torch.tensor(
             [example.teacher_value for example in examples], dtype=torch.float32
         ),
+        "example_weights": torch.tensor(
+            [example.example_weight for example in examples], dtype=torch.float32
+        ),
         "action_biases": torch.tensor(action_biases, dtype=torch.float32),
         "phases": torch.tensor(
             [example.decision.phase for example in examples], dtype=torch.uint8
@@ -620,6 +756,19 @@ def _write_shard(
     }
     payload.update(_encode_token_block("state", state_tokens, config=config))
     payload.update(_encode_token_block("action", action_tokens, config=config))
+    if paired_base_features:
+        payload["base_state_offsets"] = torch.tensor(
+            base_state_offsets, dtype=torch.int64
+        )
+        payload["base_action_offsets"] = torch.tensor(
+            base_action_offsets, dtype=torch.int64
+        )
+        payload.update(_encode_token_block(
+            "base_state", base_state_tokens, config=config
+        ))
+        payload.update(_encode_token_block(
+            "base_action", base_action_tokens, config=config
+        ))
     filename = f"shard-{shard_index:05d}.pt"
     final_path = target / filename
     temporary = final_path.with_suffix(".pt.tmp")
@@ -630,6 +779,7 @@ def _write_shard(
         "examples": len(examples),
         "state_tokens": len(state_tokens),
         "action_tokens": len(action_tokens),
+        "paired_base_features": paired_base_features,
         "bytes": final_path.stat().st_size,
     }
 
@@ -674,6 +824,28 @@ def _decode_example(payload: dict[str, Any], index: int) -> StructuredDistillati
     action_end = int(payload["action_offsets"][index + 1])
     state_tokens = _decode_token_block(payload, "state", state_start, state_end)
     action_tokens = _decode_token_block(payload, "action", action_start, action_end)
+    base_decision = None
+    if "base_state_offsets" in payload:
+        base_state_start = int(payload["base_state_offsets"][index])
+        base_state_end = int(payload["base_state_offsets"][index + 1])
+        base_action_start = int(payload["base_action_offsets"][index])
+        base_action_end = int(payload["base_action_offsets"][index + 1])
+        base_decision = StructuredDecision(
+            state_tokens=tuple(_decode_token_block(
+                payload, "base_state", base_state_start, base_state_end
+            )),
+            action_tokens=tuple(_decode_token_block(
+                payload, "base_action", base_action_start, base_action_end
+            )),
+            phase=int(payload["phases"][index]),
+            selected_index=int(payload["selected_indices"][index]),
+            action_logit_biases=tuple(
+                float(value)
+                for value in payload[
+                    "action_biases"
+                ][action_start:action_end].tolist()
+            ),
+        )
     return StructuredDistillationExample(
         decision=StructuredDecision(
             state_tokens=tuple(state_tokens),
@@ -690,6 +862,12 @@ def _decode_example(payload: dict[str, Any], index: int) -> StructuredDistillati
             for value in payload["teacher_logits"][action_start:action_end].tolist()
         ),
         teacher_value=float(payload["teacher_values"][index]),
+        base_decision=base_decision,
+        example_weight=(
+            float(payload["example_weights"][index])
+            if "example_weights" in payload
+            else 1.0
+        ),
     )
 
 

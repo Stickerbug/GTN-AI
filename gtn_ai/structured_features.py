@@ -8,6 +8,7 @@ from enum import IntEnum
 from functools import lru_cache
 from typing import Any, Iterable, Sequence
 
+from .contextual_value import contextual_value_tokens, enrich_card_for_context
 from .protocol import Action
 
 
@@ -37,6 +38,7 @@ class StructuredFeatureConfig:
     numeric_buckets: int = 32
     max_state_tokens: int = 192
     max_history_events: int = 32
+    contextual_value_features: bool = False
 
     def __post_init__(self) -> None:
         for name in (
@@ -72,6 +74,12 @@ class StructuredDecision:
 
 _PRIORITY_KEYS = (
     "def_id",
+    "definition_semantics",
+    "instance_semantics",
+    "rule_operations",
+    "rule_numbers",
+    "added_flags",
+    "removed_flags",
     "card_type",
     "quality",
     "id",
@@ -129,6 +137,18 @@ _NUMERIC_SCALES = {
     "position": 10.0,
     "probability": 1.0,
     "expected_count": 1.0,
+    "card_count": 20.0,
+    "definition_count": 20.0,
+    "instance_variant_count": 20.0,
+    "hand_free_slots": 10.0,
+    "status_count": 10.0,
+    "equipment_count": 10.0,
+    "trigger_cost_e": 10.0,
+    "trigger_cost_m": 10.0,
+    "cost_delta_e": 10.0,
+    "cost_delta_m": 10.0,
+    "fission_delta": 5.0,
+    "fusion_delta": 5.0,
 }
 
 
@@ -192,6 +212,15 @@ def encode_state_tokens(
     cards: list[EntityToken] = []
     secondary: list[EntityToken] = []
     history: list[EntityToken] = []
+
+    if config.contextual_value_features:
+        for namespace, value in contextual_value_tokens(observation):
+            essential.append(_entity_token(
+                TokenType.GLOBAL,
+                namespace,
+                value,
+                config=config,
+            ))
 
     loadout = observation.get("loadout") or {}
     for position, mod_name in enumerate(loadout.get("official_mods") or []):
@@ -376,7 +405,11 @@ def encode_action_token(
         )
     selected = _selected_visible_card(observation, action)
     if selected is not None:
-        payload["selected_card"] = selected
+        payload["selected_card"] = (
+            enrich_card_for_context(selected)
+            if config.contextual_value_features
+            else selected
+        )
     return _entity_token(
         TokenType.ACTION,
         f"action:{action.kind}",
@@ -424,10 +457,15 @@ def _card_token(
     config: StructuredFeatureConfig,
     count: Any = 1,
 ) -> EntityToken:
+    visible_card = (
+        enrich_card_for_context(card)
+        if config.contextual_value_features
+        else dict(card)
+    )
     return _entity_token(
         TokenType.CARD,
         f"card:{relation}:{zone}",
-        {"position": position, "count": count, **dict(card)},
+        {"position": position, "count": count, **visible_card},
         config=config,
     )
 
@@ -598,6 +636,8 @@ def _selected_visible_card(
             (observation.get("pending") or {}).get("candidates") or [],
             action.payload.get("candidate_slot"),
         )
+    if action.kind == "v2_ui_response":
+        return _v2_selected_visible_card(observation, action)
     own = observation.get("self") or {}
     if action.kind == "draft_pick":
         return _find_slot(own.get("draft_options") or [], action.payload.get("candidate_slot"))
@@ -608,6 +648,33 @@ def _selected_visible_card(
         )
     if action.kind == "select_opening_event":
         return _find_slot(own.get("opening_event_options") or [], action.payload.get("option_slot"))
+    return None
+
+
+def _v2_selected_visible_card(
+    observation: dict[str, Any],
+    action: Action,
+) -> dict[str, Any] | None:
+    candidates = (observation.get("pending") or {}).get("candidates") or []
+    controls = action.payload.get("controls")
+    if not isinstance(controls, list):
+        return None
+    for control in controls:
+        if not isinstance(control, dict):
+            continue
+        option_slots = control.get("option_slots")
+        if not isinstance(option_slots, list):
+            option_slots = [control.get("option_slot")]
+        for option_slot in option_slots:
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                if not _same_int(candidate.get("control_slot"), control.get("control_slot")):
+                    continue
+                if not _same_int(candidate.get("option_slot"), option_slot):
+                    continue
+                if _looks_like_card(candidate):
+                    return candidate
     return None
 
 

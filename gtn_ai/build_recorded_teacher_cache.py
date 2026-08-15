@@ -25,6 +25,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--deck-prior",
         help="Optional anonymous population deck prior added to structured inputs",
     )
+    parser.add_argument(
+        "--dynamic-deck-belief",
+        action="store_true",
+        help="Condition deck-prior tokens on public opponent card evidence",
+    )
     parser.add_argument("--shard-size", type=int, default=4096)
     parser.add_argument("--max-decisions", type=int, default=0)
     parser.add_argument("--expected-decisions", type=int, default=0)
@@ -38,6 +43,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=0.0,
         help="Keep only labels whose raw search score margin meets this threshold",
     )
+    parser.add_argument(
+        "--preserve-winner-actions",
+        action="store_true",
+        help="Keep executed actions in winning trajectories and apply search corrections to losses/draws",
+    )
+    parser.add_argument(
+        "--only-teacher-disagreements",
+        action="store_true",
+        help="Keep only decisions where the offline teacher changes the executed action",
+    )
     args = parser.parse_args(argv)
     require_torch()
     checkpoint = load_structured_checkpoint(args.config_checkpoint, device="cpu")
@@ -46,11 +61,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir=args.output,
         config=checkpoint["config"],
         deck_prior_path=args.deck_prior,
+        dynamic_deck_belief=args.dynamic_deck_belief,
         shard_size=args.shard_size,
         max_decisions=args.max_decisions,
         expected_decisions=args.expected_decisions,
         skip_recovered_episodes=not args.include_recovered_episodes,
         min_teacher_margin=args.min_teacher_margin,
+        only_teacher_disagreements=args.only_teacher_disagreements,
+        preserve_winner_actions=args.preserve_winner_actions,
         overwrite=args.overwrite,
         progress_interval=args.progress_interval,
         show_progress=not args.quiet,

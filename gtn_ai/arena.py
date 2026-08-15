@@ -7,6 +7,7 @@ import math
 import statistics
 import time
 from collections import Counter
+from pathlib import Path
 from typing import Any, Sequence
 
 from .environment import Garden1v1Env
@@ -69,6 +70,7 @@ def run_arena(
     diagnostic_policies: set[str] = set()
     offline_search_diagnostics: Counter[str] = Counter()
     offline_search_policies: set[str] = set()
+    anomalies: list[dict[str, Any]] = []
     completed_pairs = 0
     progress = ProgressReporter(
         "arena",
@@ -93,6 +95,18 @@ def run_arena(
                     scores.append(0.0)
                 elif outcome == "draw":
                     scores.append(0.5)
+                if (
+                    int(game.get("loop_recoveries", 0)) > 0
+                    or int(game.get("forced_fallback_actions", 0)) > 0
+                ):
+                    anomalies.append({
+                        "seed": int(game["seed"]),
+                        "reverse": bool(game["reverse"]),
+                        "loop_recoveries": int(game.get("loop_recoveries", 0)),
+                        "forced_fallback_actions": int(
+                            game.get("forced_fallback_actions", 0)
+                        ),
+                    })
                 for diagnostic in game.get("policy_diagnostics") or []:
                     policy_name = str(diagnostic.get("policy") or "unnamed-policy")
                     diagnostic_policies.add(policy_name)
@@ -121,6 +135,10 @@ def run_arena(
                         "belief_deck_prior_samples",
                         "belief_deck_prior_cards",
                         "belief_exact_prior_samples",
+                        "repeated_action_avoids",
+                        "choice_autocompletions",
+                        "choice_backtrack_filters",
+                        "forced_progress_actions",
                     ):
                         value = int(diagnostic.get(key, 0) or 0)
                         policy_diagnostics[key] += value
@@ -156,6 +174,7 @@ def run_arena(
     mean_score = statistics.fmean(scores) if scores else 0.0
     interval = _normal_score_interval(scores)
     return {
+        "seed": int(seed),
         "policy_a": str(policy_a),
         "policy_b": str(policy_b),
         "pairs": pair_count,
@@ -170,9 +189,12 @@ def run_arena(
         "combat_steps": combat_steps,
         "loop_recoveries": loop_recoveries,
         "forced_fallback_actions": forced_fallback_actions,
+        "anomalies": anomalies,
         "seconds": round(elapsed, 3),
         "games_per_second": round((pair_count * 2) / elapsed, 3) if elapsed else 0.0,
         "workers": worker_count,
+        "max_steps": int(max_steps),
+        "enabled_mods": list(enabled_mods) if enabled_mods is not None else None,
         "sampled_mod_combinations": bool(sample_mod_combinations),
         "policy_diagnostics": (
             {
@@ -244,9 +266,13 @@ def _play_pair(job: dict[str, Any]) -> dict[str, Any]:
             winner_is_a = (episode.winner == 1) if reverse else (episode.winner == 0)
             outcome = "a_win" if winner_is_a else "b_win"
         games.append({
+            "seed": pair_seed,
+            "reverse": reverse,
             "outcome": outcome,
             "steps": episode.steps,
             "rounds": episode.rounds,
+            "loop_recoveries": episode.loop_recoveries,
+            "forced_fallback_actions": episode.forced_fallback_actions,
             "policy_diagnostics": diagnostics,
         })
     return {
@@ -286,6 +312,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--progress-interval", type=float, default=10.0)
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--output", help="Optional JSON result path")
     args = parser.parse_args(argv)
     summary = run_arena(
         pairs=args.pairs,
@@ -299,7 +326,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         progress_interval=args.progress_interval,
         show_progress=not args.quiet,
     )
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    rendered = json.dumps(summary, ensure_ascii=False, indent=2)
+    if args.output:
+        target = Path(args.output)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(rendered + "\n", encoding="utf-8")
+    print(rendered)
     return 0
 
 

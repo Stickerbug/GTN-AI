@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import random
 import time
@@ -29,6 +31,11 @@ class UnsafeRolloutConfig:
     rollout_batch: int = 2
     base_margin_gate: float | None = None
     belief_deck_prior_path: str | None = None
+    common_random_numbers: bool = True
+    avoid_repeated_actions: bool = True
+    auto_submit_exact_choices: bool = True
+    avoid_choice_backtracking: bool = True
+    safe_annotation_execution: bool = False
 
     def __post_init__(self) -> None:
         if not 1 <= int(self.candidates) <= 32:
@@ -118,7 +125,26 @@ class UnsafeFullStateRolloutPolicy:
         self._belief_deck_prior_samples = 0
         self._belief_deck_prior_cards = 0
         self._belief_exact_prior_samples = 0
+        self._repeated_action_avoids = 0
+        self._choice_autocompletions = 0
+        self._choice_backtrack_filters = 0
+        self._seen_actions_by_state: dict[str, set[str]] = {}
+        self._turn_key: tuple[Any, ...] | None = None
         self._seconds = 0.0
+
+    def fork(self, *, seed: int, name: str | None = None, **_kwargs):
+        """Create session-local search state while sharing immutable model weights."""
+
+        return UnsafeFullStateRolloutPolicy(
+            self.base_policy.fork(
+                seed=int(seed),
+                temperature=0.0,
+                record_behavior=False,
+                name=name or self.base_policy.name,
+            ),
+            config=self.config,
+            seed=int(seed),
+        )
 
     def select_action(
         self,
@@ -147,13 +173,26 @@ class UnsafeFullStateRolloutPolicy:
         self.last_teacher_metadata = None
         self.last_search_metadata = None
         self._decisions += 1
-        if observation.get("phase") == "pregame" or len(actions) == 1:
+        self._start_turn(observation)
+        if self.config.auto_submit_exact_choices and not self.config.annotate_only:
+            submit_index = _exact_choice_submit_index(observation, actions)
+            if submit_index is not None:
+                self._bypassed_decisions += 1
+                self._choice_autocompletions += 1
+                return actions[submit_index]
+        eligible_indices = list(range(len(actions)))
+        if self.config.avoid_choice_backtracking and not self.config.annotate_only:
+            eligible_indices = _choice_progress_indices(observation, actions)
+            if len(eligible_indices) < len(actions):
+                self._choice_backtrack_filters += 1
+        eligible_actions = [actions[index] for index in eligible_indices]
+        if observation.get("phase") == "pregame" or len(eligible_actions) == 1:
             self._bypassed_decisions += 1
-            return self.base_policy.select_action(observation, actions)
+            return self.base_policy.select_action(observation, eligible_actions)
 
         started = time.perf_counter()
         logits, _ = self.base_policy.evaluate_actions(observation, actions)
-        ranked = sorted(range(len(actions)), key=lambda index: (-logits[index], index))
+        ranked = sorted(eligible_indices, key=lambda index: (-logits[index], index))
         base_margin = (
             float(logits[ranked[0]]) - float(logits[ranked[1]])
             if len(ranked) > 1
@@ -226,24 +265,55 @@ class UnsafeFullStateRolloutPolicy:
                 return actions[ranked[0]]
 
         selected_index = max(scored)[2]
+        if self.config.avoid_repeated_actions and not self.config.annotate_only:
+            state_key = _public_state_key(observation)
+            seen_actions = self._seen_actions_by_state.setdefault(state_key, set())
+            unseen_scored = [
+                entry for entry in scored
+                if actions[entry[2]].key not in seen_actions
+            ]
+            if unseen_scored:
+                repeat_safe_index = max(unseen_scored)[2]
+            else:
+                unseen_ranked = [
+                    index for index in ranked
+                    if actions[index].key not in seen_actions
+                ]
+                repeat_safe_index = (
+                    unseen_ranked[0]
+                    if unseen_ranked
+                    else eligible_indices[_progress_action_index(
+                        observation,
+                        eligible_actions,
+                    )]
+                )
+            if repeat_safe_index != selected_index:
+                self._repeated_action_avoids += 1
+                selected_index = repeat_safe_index
+            seen_actions.add(actions[selected_index].key)
         self._searched_decisions += 1
         self._candidate_evaluations += len(candidate_indices)
         self._action_changes += int(selected_index != ranked[0])
         elapsed = time.perf_counter() - started
         self._seconds += elapsed
+        execution_index = ranked[0] if self.config.annotate_only else selected_index
+        if self.config.annotate_only and self.config.safe_annotation_execution:
+            execution_index = self._safe_annotation_execution_index(
+                observation,
+                actions,
+                ranked,
+            )
         self.last_search_metadata = {
             "base_action_key": actions[ranked[0]].key,
             "selected_action_key": actions[selected_index].key,
-            "executed_action_key": actions[
-                ranked[0] if self.config.annotate_only else selected_index
-            ].key,
+            "executed_action_key": actions[execution_index].key,
             "changed": selected_index != ranked[0],
             "seconds": round(elapsed, 6),
             "rollouts_used": rollouts_used,
             "score_margin": round(score_margin, 7),
             "candidates": metadata_candidates,
         }
-        if self.config.determinize_hidden:
+        if self.config.determinize_hidden and selected_index in candidate_indices:
             candidate_scores = {
                 action_index: score
                 for score, _, action_index in scored
@@ -272,7 +342,52 @@ class UnsafeFullStateRolloutPolicy:
                 "search_margin": round(score_margin, 7),
                 "rollouts": rollouts_used,
             }
-        return actions[ranked[0] if self.config.annotate_only else selected_index]
+        return actions[execution_index]
+
+    def _start_turn(self, observation: dict[str, Any]) -> None:
+        turn_key = (
+            str(observation.get("phase") or ""),
+            observation.get("round"),
+            observation.get("current_player"),
+            observation.get("decision_player"),
+        )
+        if turn_key == self._turn_key:
+            return
+        self._turn_key = turn_key
+        self._seen_actions_by_state.clear()
+
+    def _safe_annotation_execution_index(
+        self,
+        observation: dict[str, Any],
+        actions: Sequence[Action],
+        ranked: Sequence[int],
+    ) -> int:
+        submit_index = _exact_choice_submit_index(observation, actions)
+        if submit_index is not None:
+            self._choice_autocompletions += 1
+            return submit_index
+        eligible_indices = _choice_progress_indices(observation, actions)
+        if len(eligible_indices) < len(actions):
+            self._choice_backtrack_filters += 1
+        eligible = set(eligible_indices)
+        ranked_eligible = [index for index in ranked if index in eligible]
+        state_key = _public_state_key(observation)
+        seen = self._seen_actions_by_state.setdefault(state_key, set())
+        unseen = [
+            index for index in ranked_eligible
+            if actions[index].key not in seen
+        ]
+        if unseen:
+            selected_index = unseen[0]
+        else:
+            local_index = _progress_action_index(
+                observation,
+                [actions[index] for index in eligible_indices],
+            )
+            selected_index = eligible_indices[local_index]
+            self._repeated_action_avoids += 1
+        seen.add(actions[selected_index].key)
+        return selected_index
 
     def _append_rollout_batch(
         self,
@@ -395,6 +510,9 @@ class UnsafeFullStateRolloutPolicy:
             "belief_deck_prior_samples": self._belief_deck_prior_samples,
             "belief_deck_prior_cards": self._belief_deck_prior_cards,
             "belief_exact_prior_samples": self._belief_exact_prior_samples,
+            "repeated_action_avoids": self._repeated_action_avoids,
+            "choice_autocompletions": self._choice_autocompletions,
+            "choice_backtrack_filters": self._choice_backtrack_filters,
             "belief_deck_prior_fingerprint": (
                 self._belief_deck_prior.fingerprint if self._belief_deck_prior else ""
             ),
@@ -405,6 +523,19 @@ class UnsafeFullStateRolloutPolicy:
         return (
             self.seed
             ^ (self._decisions * 0x9E3779B1)
+            ^ (int(rollout_index) * 0xC2B2AE3D)
+        ) & 0x7FFFFFFF
+
+    def _rollout_seed(self, *, action_index: int, rollout_index: int) -> int:
+        action_component = (
+            0
+            if self.config.common_random_numbers
+            else int(action_index) * 0x85EBCA77
+        )
+        return (
+            self.seed
+            ^ (self._decisions * 0x9E3779B1)
+            ^ action_component
             ^ (int(rollout_index) * 0xC2B2AE3D)
         ) & 0x7FFFFFFF
 
@@ -422,12 +553,10 @@ class UnsafeFullStateRolloutPolicy:
         branch = env.clone()
         branch.step(root_action, root_player)
         steps = 1
-        rollout_seed = (
-            self.seed
-            ^ (self._decisions * 0x9E3779B1)
-            ^ (int(action_index) * 0x85EBCA77)
-            ^ (int(rollout_index) * 0xC2B2AE3D)
-        ) & 0x7FFFFFFF
+        rollout_seed = self._rollout_seed(
+            action_index=action_index,
+            rollout_index=rollout_index,
+        )
         policies = (
             HeuristicPolicy(
                 seed=rollout_seed * 2,
@@ -511,6 +640,11 @@ def parse_unsafe_rollout_spec(spec: str) -> tuple[str, UnsafeRolloutConfig]:
         "batch": int,
         "gate": float,
         "deck-prior": str,
+        "crn": _parse_bool,
+        "avoid-repeats": _parse_bool,
+        "auto-submit": _parse_bool,
+        "avoid-choice-backtracking": _parse_bool,
+        "safe-annotate": _parse_bool,
     }
     names = {
         "exploration": "rollout_exploration",
@@ -523,6 +657,11 @@ def parse_unsafe_rollout_spec(spec: str) -> tuple[str, UnsafeRolloutConfig]:
         "batch": "rollout_batch",
         "gate": "base_margin_gate",
         "deck-prior": "belief_deck_prior_path",
+        "crn": "common_random_numbers",
+        "avoid-repeats": "avoid_repeated_actions",
+        "auto-submit": "auto_submit_exact_choices",
+        "avoid-choice-backtracking": "avoid_choice_backtracking",
+        "safe-annotate": "safe_annotation_execution",
     }
     for option in parts[1:]:
         if not option:
@@ -533,6 +672,129 @@ def parse_unsafe_rollout_spec(spec: str) -> tuple[str, UnsafeRolloutConfig]:
             raise ValueError(f"unknown unsafe rollout option: {option}")
         values[names.get(normalized, normalized)] = converters[normalized](raw_value.strip())
     return checkpoint, UnsafeRolloutConfig(**values)
+
+
+def _public_state_key(observation: dict[str, Any]) -> str:
+    stable = dict(observation)
+    stable.pop("public_history", None)
+    encoded = json.dumps(
+        stable,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.blake2b(encoded.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def _progress_action_index(
+    observation: dict[str, Any],
+    actions: Sequence[Action],
+) -> int:
+    """Choose a deterministic action that is likely to leave a repeated state."""
+
+    preferred_kinds = (
+        "submit_choice",
+        "default_choice",
+        "select_choice",
+        "append_choice_order",
+        "toggle_choice",
+        "respond",
+        "resolve_choice",
+        "v2_ui_response",
+        "use_trigger",
+        "play_card",
+        "end_turn",
+    )
+    pending = observation.get("pending") or {}
+    selected = set((pending.get("selection") or {}).get("selected_slots") or [])
+    for kind in preferred_kinds:
+        for index, action in enumerate(actions):
+            if action.kind != kind:
+                continue
+            choice = action.payload.get("choice") or {}
+            if choice.get("cancelled") or choice.get("cancel"):
+                continue
+            if kind == "respond" and action.payload.get("hand_slot") is not None:
+                continue
+            if (
+                kind == "toggle_choice"
+                and action.payload.get("candidate_slot") in selected
+            ):
+                continue
+            return index
+    return 0
+
+
+def _exact_choice_submit_index(
+    observation: dict[str, Any],
+    actions: Sequence[Action],
+) -> int | None:
+    """Finish a fixed-size choice once all required items are selected."""
+
+    pending = observation.get("pending") or {}
+    constraints = pending.get("constraints") or {}
+    selection = pending.get("selection") or {}
+    selected = selection.get("selected_slots") or []
+    try:
+        minimum = int(constraints.get("min_count"))
+        maximum = int(constraints.get("max_count"))
+    except (TypeError, ValueError):
+        return None
+    if minimum <= 0 or minimum != maximum or len(selected) != maximum:
+        return None
+    return next(
+        (index for index, action in enumerate(actions) if action.kind == "submit_choice"),
+        None,
+    )
+
+
+def _choice_progress_indices(
+    observation: dict[str, Any],
+    actions: Sequence[Action],
+) -> list[int]:
+    """Remove reversible UI actions when a pending choice can make progress."""
+
+    pending = observation.get("pending") or {}
+    selected = {
+        str(slot)
+        for slot in (pending.get("selection") or {}).get("selected_slots") or []
+    }
+    if not selected:
+        return list(range(len(actions)))
+
+    choice_type = str(pending.get("choice_type") or "")
+    if choice_type == "reorder_deck":
+        filtered = [
+            index
+            for index, action in enumerate(actions)
+            if action.kind != "reset_choice_order"
+        ]
+        return filtered or list(range(len(actions)))
+
+    constraints = pending.get("constraints") or {}
+    try:
+        minimum = int(constraints.get("min_count"))
+        maximum = int(constraints.get("max_count"))
+    except (TypeError, ValueError):
+        return list(range(len(actions)))
+    if minimum <= 0 or minimum != maximum or len(selected) >= maximum:
+        return list(range(len(actions)))
+
+    unselected_toggles = {
+        index
+        for index, action in enumerate(actions)
+        if action.kind == "toggle_choice"
+        and str(action.payload.get("candidate_slot")) not in selected
+    }
+    if not unselected_toggles:
+        return list(range(len(actions)))
+    filtered = [
+        index
+        for index, action in enumerate(actions)
+        if action.kind != "toggle_choice"
+        or str(action.payload.get("candidate_slot")) not in selected
+    ]
+    return filtered or list(range(len(actions)))
 
 
 def _softmax(values: Sequence[float]) -> list[float]:

@@ -486,6 +486,128 @@ def test_dynamic_wide_strike_v2_target_is_resolved_without_policy_target_action(
     assert env.engine.players[target].health < before
 
 
+def test_v2_ui_actions_use_stable_slots_and_execute_through_production_validator():
+    env = make_env(109)
+    from cards import CardInstance
+    from mod_runtime_v2 import _sanitize_ui_component
+
+    actor = env.decision_player()
+    target = 1 - actor
+    cards = [CardInstance("Basic"), CardInstance("Bone"), CardInstance("Stinger")]
+    env.engine.players[actor].hand = cards
+    context = {"source_player": actor, "target_player": target, "vars": {}}
+    component = _sanitize_ui_component(env.engine, context, {
+        "type": "modal",
+        "controls": [
+            {
+                "id": "mode",
+                "type": "select",
+                "options": [
+                    {"value": "alpha", "label": "Alpha"},
+                    {"value": "beta", "label": "Beta"},
+                ],
+            },
+            {
+                "id": "cards",
+                "type": "multi_card_picker",
+                "target": actor,
+                "zone": "hand",
+                "allowed_instance_ids": [card.instance_id for card in cards],
+                "min_select": 2,
+                "max_select": 2,
+            },
+            {
+                "id": "target",
+                "type": "player_picker",
+                "allowed_player_ids": [actor, target],
+            },
+        ],
+        "buttons": [
+            {"id": "confirm", "role": "confirm"},
+            {"id": "cancel", "role": "cancel"},
+        ],
+    })
+    env.engine.pending_v2_ui = {
+        "request_id": "test-v2-ui",
+        "player_id": actor,
+        "component": component,
+        "context": context,
+        "remaining_steps": [],
+        "on_cancel": [],
+    }
+
+    actions = env.legal_actions(actor)
+    assert len(actions) == 13
+    assert all(action.kind == "v2_ui_response" for action in actions)
+    assert "instance_id" not in json.dumps(
+        [action.to_dict() for action in actions],
+        ensure_ascii=False,
+    )
+    target_option_slot = next(
+        slot for slot, option in enumerate(component["controls"][2]["options"])
+        if int(option["value"]) == target
+    )
+    selected = next(
+        action for action in actions
+        if action.payload["button_slot"] == 0
+        and action.payload["controls"][0]["option_slot"] == 1
+        and action.payload["controls"][1]["option_slots"] == [1, 2]
+        and action.payload["controls"][2]["option_slot"] == target_option_slot
+    )
+    observation = env.observe(actor)
+    assert observation["pending"]["actor"] == actor
+    assert observation["pending"]["component_type"] == "modal"
+    assert len(observation["pending"]["controls"]) == 3
+    assert not _keys_matching(observation["pending"], "instance")
+    assert {candidate.get("def_id") for candidate in observation["pending"]["candidates"]} >= {
+        "Basic", "Bone", "Stinger",
+    }
+    private_view = env.observe(target)["pending"]
+    assert private_view == {"kind": "mod_ui", "actor": actor, "private": True}
+    from gtn_ai.structured_features import _selected_visible_card
+    assert _selected_visible_card(observation, selected)["def_id"] == "Bone"
+
+    result = env.step(selected, actor)
+
+    assert not result.terminated
+    assert env.engine.pending_v2_ui is None
+    values = context["current_action"]["v2_ui"]["values"]
+    assert values == {
+        "mode": "beta",
+        "cards": [cards[1].instance_id, cards[2].instance_id],
+        "target": target,
+    }
+
+
+def test_v2_ui_cancel_has_valid_defaults_for_required_controls():
+    env = make_env(110)
+    from mod_runtime_v2 import _sanitize_ui_component
+
+    actor = env.decision_player()
+    context = {"source_player": actor, "target_player": actor, "vars": {}}
+    component = _sanitize_ui_component(env.engine, context, {
+        "type": "modal",
+        "controls": [{"id": "amount", "type": "number", "min": 2, "max": 4, "default": 3}],
+        "buttons": [
+            {"id": "confirm", "role": "confirm"},
+            {"id": "cancel", "role": "cancel"},
+        ],
+    })
+    env.engine.pending_v2_ui = {
+        "request_id": "test-v2-cancel",
+        "player_id": actor,
+        "component": component,
+        "context": context,
+        "remaining_steps": [],
+        "on_cancel": [],
+    }
+
+    cancel = next(action for action in env.legal_actions(actor) if action.payload["button_slot"] == 1)
+    assert cancel.payload["controls"] == [{"control_slot": 0, "value": 3}]
+    env.step(cancel, actor)
+    assert env.engine.pending_v2_ui is None
+
+
 def _keys_matching(value, fragment: str) -> list[str]:
     result = []
     if isinstance(value, dict):

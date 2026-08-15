@@ -209,9 +209,38 @@ def _selected_visible_card(observation: dict[str, Any], action: Action) -> dict[
     elif action.kind == "select_opening_event":
         slot = action.payload.get("option_slot")
         cards = (observation.get("self") or {}).get("opening_event_options") or []
+    elif action.kind == "v2_ui_response":
+        return _v2_selected_visible_card(observation, action)
     else:
         return None
     return _find_slot(cards, slot)
+
+
+def _v2_selected_visible_card(
+    observation: dict[str, Any],
+    action: Action,
+) -> dict[str, Any] | None:
+    candidates = (observation.get("pending") or {}).get("candidates") or []
+    controls = action.payload.get("controls")
+    if not isinstance(controls, list):
+        return None
+    for control in controls:
+        if not isinstance(control, dict):
+            continue
+        option_slots = control.get("option_slots")
+        if not isinstance(option_slots, list):
+            option_slots = [control.get("option_slot")]
+        for option_slot in option_slots:
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                if not _same_int(candidate.get("control_slot"), control.get("control_slot")):
+                    continue
+                if not _same_int(candidate.get("option_slot"), option_slot):
+                    continue
+                if candidate.get("def_id") or candidate.get("card_type"):
+                    return candidate
+    return None
 
 
 def _find_slot(items: Iterable[Any], slot: Any) -> dict[str, Any] | None:

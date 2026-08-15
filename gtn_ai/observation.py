@@ -544,12 +544,79 @@ def _pending_view(env, viewer_id: int, public: dict[str, Any]) -> dict[str, Any]
             result["private"] = True
         return result
     if engine.pending_v2_ui is not None:
-        pending = public.get("pending_v2_ui") or {}
-        return {
+        private_pending = engine.pending_v2_ui
+        actor = _as_int(private_pending.get("player_id"), -1)
+        result: dict[str, Any] = {
             "kind": "mod_ui",
-            "actor": _as_int(pending.get("player_id"), -1),
-            "component": str(pending.get("component") or pending.get("component_id") or ""),
+            "actor": actor,
         }
+        if actor != viewer_id:
+            result["private"] = True
+            return result
+        public_pending = public.get("pending_v2_ui") or {}
+        component = public_pending.get("component") if isinstance(public_pending, dict) else None
+        if not isinstance(component, dict):
+            component = private_pending.get("component")
+        if not isinstance(component, dict):
+            result["component_type"] = "unknown"
+            return result
+        result["component_type"] = str(component.get("type") or "modal")
+        result["buttons"] = [
+            {
+                "slot": slot,
+                "role": str(button.get("role") or (
+                    "cancel" if str(button.get("id")) == "cancel" else "confirm"
+                )),
+            }
+            for slot, button in enumerate(component.get("buttons") or [])
+            if isinstance(button, dict)
+        ]
+        controls = []
+        candidates = []
+        for control_slot, control in enumerate(component.get("controls") or []):
+            if not isinstance(control, dict):
+                continue
+            ctype = str(control.get("type") or "text")
+            summary: dict[str, Any] = {
+                "slot": int(control_slot),
+                "type": ctype,
+            }
+            if ctype in {"slider", "number", "number_input"}:
+                for key in ("min", "max", "step", "default"):
+                    if _is_public_scalar(control.get(key)):
+                        summary[key] = _safe_scalar(control.get(key))
+            options = [
+                option for option in (control.get("options") or [])
+                if isinstance(option, dict)
+            ]
+            if options:
+                summary["option_count"] = len(options)
+            for key in ("min_select", "max_select"):
+                if _is_public_scalar(control.get(key)):
+                    summary[key] = _safe_scalar(control.get(key))
+            controls.append(summary)
+            for option_slot, option in enumerate(options):
+                candidate: dict[str, Any] = {
+                    "slot": len(candidates),
+                    "control_slot": int(control_slot),
+                    "option_slot": int(option_slot),
+                }
+                card = option.get("card")
+                if isinstance(card, dict):
+                    candidate.update(_mask_card_dict(_card_dict_view(card), blind_level))
+                elif ctype in {"player_picker", "target_picker"}:
+                    player_id = _as_int(option.get("value"), -1)
+                    if player_id in (0, 1):
+                        candidate["target_player"] = player_id
+                else:
+                    semantic = option.get("value")
+                    if isinstance(semantic, (str, bool)) and len(str(semantic)) <= 64:
+                        candidate["semantic"] = semantic
+                candidates.append(candidate)
+        result["controls"] = controls
+        if candidates:
+            result["candidates"] = candidates
+        return result
     return None
 
 

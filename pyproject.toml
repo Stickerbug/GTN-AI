@@ -31,6 +31,10 @@ gtn-ai-build-experience-prior = "gtn_ai.experience_prior:main"
 gtn-ai-build-deck-prior = "gtn_ai.deck_prior:main"
 gtn-ai-aggregate-replays = "gtn_ai.historical_aggregate:main"
 gtn-ai-validate-loadouts = "gtn_ai.validate_loadouts:main"
+gtn-ai-live-worker = "gtn_ai.live_worker:main"
+gtn-ai-import-diagnostics = "gtn_ai.diagnostic_data:main"
+gtn-ai-relabel-diagnostics = "gtn_ai.diagnostic_relabel:main"
+gtn-ai-curate-hard-examples = "gtn_ai.hard_examples:main"
 
 [tool.setuptools.packages.find]
 include = ["gtn_ai*"]

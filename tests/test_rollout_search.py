@@ -6,9 +6,12 @@ from gtn_ai import Garden1v1Env
 from gtn_ai.belief_sampling import determinize_hidden_cards
 from gtn_ai.inference_server import DecisionService
 from gtn_ai.neural_model import torch_available
+from gtn_ai.progress_policy import ProgressSafePolicy
+from gtn_ai.protocol import Action
 from gtn_ai.rollout_search import (
     UnsafeFullStateRolloutPolicy,
     UnsafeRolloutConfig,
+    _choice_progress_indices,
     parse_unsafe_rollout_spec,
 )
 from gtn_ai.structured_model import (
@@ -91,6 +94,27 @@ def test_full_state_rollout_search_cannot_be_served() -> None:
         search.select_action(env.observe(env.decision_player()), env.legal_actions())
 
 
+def test_rollout_policy_fork_shares_model_weights_but_not_search_state() -> None:
+    env = Garden1v1Env(
+        enabled_mods=["Vanilla Cards.gtnmod"],
+        seed=1905,
+        include_pregame=False,
+    )
+    env.reset()
+    search = UnsafeFullStateRolloutPolicy(
+        _policy(env),
+        config=UnsafeRolloutConfig(candidates=1, rollouts=1, horizon=0),
+        seed=1,
+    )
+
+    forked = search.fork(seed=2)
+
+    assert forked is not search
+    assert forked.base_policy is not search.base_policy
+    assert forked.base_policy.model is search.base_policy.model
+    assert forked.config is search.config
+
+
 def test_unsafe_rollout_spec_parses_and_rejects_unknown_options() -> None:
     checkpoint, config = parse_unsafe_rollout_spec(
         "models/model.pt;candidates=4;rollouts=3;horizon=6;exploration=.1;prior=.03;belief=true;deck-prior=models/decks.json"
@@ -121,6 +145,249 @@ def test_unsafe_rollout_spec_parses_adaptive_sampling_options() -> None:
     assert config.max_rollouts == 8
     assert config.confidence_margin == pytest.approx(0.075)
     assert config.rollout_batch == 2
+
+
+def test_rollout_spec_can_disable_common_random_numbers() -> None:
+    _, config = parse_unsafe_rollout_spec(
+        "models/model.pt;crn=false;avoid-repeats=false;auto-submit=false;avoid-choice-backtracking=false"
+    )
+
+    assert config.common_random_numbers is False
+    assert config.avoid_repeated_actions is False
+    assert config.auto_submit_exact_choices is False
+    assert config.avoid_choice_backtracking is False
+
+
+def test_rollout_spec_can_enable_safe_annotation_execution() -> None:
+    _, config = parse_unsafe_rollout_spec(
+        "models/model.pt;annotate=true;safe-annotate=true"
+    )
+
+    assert config.annotate_only is True
+    assert config.safe_annotation_execution is True
+
+
+def test_rollout_candidates_share_random_seed_by_default() -> None:
+    env = Garden1v1Env(
+        enabled_mods=["Vanilla Cards.gtnmod"],
+        seed=19023,
+        include_pregame=False,
+    )
+    env.reset()
+    search = UnsafeFullStateRolloutPolicy(
+        _policy(env),
+        config=UnsafeRolloutConfig(),
+        seed=190231,
+    )
+
+    first = search._rollout_seed(action_index=0, rollout_index=2)
+    second = search._rollout_seed(action_index=7, rollout_index=2)
+
+    assert first == second
+
+
+def test_rollout_search_avoids_repeating_an_action_in_the_same_public_state(
+    monkeypatch,
+) -> None:
+    env = Garden1v1Env(
+        enabled_mods=["Vanilla Cards.gtnmod"],
+        seed=19024,
+        include_pregame=False,
+    )
+    env.reset()
+    actor = env.decision_player()
+    observation = env.observe(actor)
+    legal = env.legal_actions(actor)
+    search = UnsafeFullStateRolloutPolicy(
+        _policy(env),
+        config=UnsafeRolloutConfig(
+            candidates=min(3, len(legal)),
+            rollouts=1,
+            horizon=0,
+        ),
+        seed=190241,
+    )
+    def fixed_rollouts(
+        env,
+        actions,
+        candidate_indices,
+        candidate_returns,
+        *,
+        root_player,
+        start_rollout,
+        stop_rollout,
+    ):
+        count = stop_rollout - start_rollout
+        for position, values in enumerate(candidate_returns):
+            values.extend([1.0 - position] * count)
+
+    monkeypatch.setattr(search, "_append_rollout_batch", fixed_rollouts)
+
+    first = search.select_action_with_env(env, observation, legal, actor)
+    second = search.select_action_with_env(env, observation, legal, actor)
+
+    assert first != second
+    assert search.diagnostics()["repeated_action_avoids"] == 1
+
+
+def test_progress_safe_policy_uses_the_best_unseen_action() -> None:
+    class FixedPolicy:
+        name = "fixed"
+        ruleset_fingerprint = "rules"
+        model_fingerprint = "model"
+
+        @staticmethod
+        def evaluate_actions(observation, actions):
+            return [float(len(actions) - index) for index in range(len(actions))], 0.0
+
+    policy = ProgressSafePolicy(FixedPolicy())
+    observation = {
+        "phase": "action",
+        "round": 2,
+        "current_player": 0,
+        "decision_player": 0,
+    }
+    actions = [Action("play_card", {"hand_slot": index}) for index in range(3)]
+
+    assert policy.select_action(observation, actions) == actions[0]
+    assert policy.select_action(observation, actions) == actions[1]
+    assert policy.select_action(observation, actions) == actions[2]
+    diagnostics = policy.diagnostics()
+    assert diagnostics["repeated_action_avoids"] == 2
+    assert diagnostics["forced_progress_actions"] == 0
+
+
+def test_progress_safe_policy_clears_repeat_memory_on_the_next_turn() -> None:
+    class FixedPolicy:
+        name = "fixed"
+
+        @staticmethod
+        def evaluate_actions(observation, actions):
+            return [2.0, 1.0], 0.0
+
+    policy = ProgressSafePolicy(FixedPolicy())
+    observation = {
+        "phase": "action",
+        "round": 2,
+        "current_player": 0,
+        "decision_player": 0,
+    }
+    actions = [Action("play_card", {"hand_slot": 0}), Action("end_turn")]
+
+    assert policy.select_action(observation, actions) == actions[0]
+    next_turn = {**observation, "round": 3}
+    assert policy.select_action(next_turn, actions) == actions[0]
+
+
+def test_progress_safe_policy_submits_a_completed_fixed_choice() -> None:
+    class FixedPolicy:
+        name = "fixed"
+
+        @staticmethod
+        def select_action(observation, actions):
+            return actions[0]
+
+    policy = ProgressSafePolicy(FixedPolicy())
+    observation = {
+        "phase": "action",
+        "round": 2,
+        "current_player": 0,
+        "decision_player": 0,
+        "pending": {
+            "selection": {"selected_slots": [3]},
+            "constraints": {"min_count": 1, "max_count": 1},
+        },
+    }
+    actions = [
+        Action("toggle_choice", {"candidate_slot": 3}),
+        Action("submit_choice"),
+    ]
+
+    assert policy.select_action(observation, actions).kind == "submit_choice"
+    assert policy.diagnostics()["choice_autocompletions"] == 1
+
+
+def test_rollout_search_submits_a_completed_fixed_size_choice() -> None:
+    env = Garden1v1Env(
+        enabled_mods=["Vanilla Cards.gtnmod"],
+        seed=19025,
+        include_pregame=False,
+    )
+    env.reset()
+    actor = env.decision_player()
+    observation = env.observe(actor)
+    observation["pending"] = {
+        "kind": "choice",
+        "selection": {"selected_slots": [3]},
+        "constraints": {"min_count": 1, "max_count": 1},
+    }
+    legal = [
+        Action("toggle_choice", {"candidate_slot": 3}),
+        Action("submit_choice"),
+        Action("resolve_choice", {"choice": {"cancelled": True}}),
+    ]
+    search = UnsafeFullStateRolloutPolicy(
+        _policy(env),
+        config=UnsafeRolloutConfig(candidates=2, rollouts=1, horizon=0),
+        seed=190251,
+    )
+
+    selected = search.select_action_with_env(env, observation, legal, actor)
+
+    assert selected.kind == "submit_choice"
+    diagnostics = search.diagnostics()
+    assert diagnostics["choice_autocompletions"] == 1
+    assert diagnostics["searched_decisions"] == 0
+
+
+def test_choice_progress_keeps_compatible_fixed_choice_and_drops_backtracking() -> None:
+    observation = {
+        "pending": {
+            "choice_type": "choose_cards_from_hand",
+            "selection": {"selected_slots": [2]},
+            "constraints": {"min_count": 2, "max_count": 2},
+        }
+    }
+    actions = [
+        Action("toggle_choice", {"candidate_slot": 2}),
+        Action("toggle_choice", {"candidate_slot": 4}),
+        Action("resolve_choice", {"choice": {"cancelled": True}}),
+    ]
+
+    indices = _choice_progress_indices(observation, actions)
+
+    assert indices == [1, 2]
+
+
+def test_choice_progress_allows_backtracking_without_a_compatible_candidate() -> None:
+    observation = {
+        "pending": {
+            "choice_type": "choose_cards_from_hand",
+            "selection": {"selected_slots": [2]},
+            "constraints": {"min_count": 2, "max_count": 2},
+        }
+    }
+    actions = [
+        Action("toggle_choice", {"candidate_slot": 2}),
+        Action("resolve_choice", {"choice": {"cancelled": True}}),
+    ]
+
+    assert _choice_progress_indices(observation, actions) == [0, 1]
+
+
+def test_choice_progress_drops_reorder_reset_after_ordering_begins() -> None:
+    observation = {
+        "pending": {
+            "choice_type": "reorder_deck",
+            "selection": {"selected_slots": [3, 1]},
+        }
+    }
+    actions = [
+        Action("append_choice_order", {"candidate_slot": 4}),
+        Action("reset_choice_order"),
+    ]
+
+    assert _choice_progress_indices(observation, actions) == [0]
 
 
 def test_adaptive_rollout_expands_uncertain_decision_to_configured_maximum() -> None:

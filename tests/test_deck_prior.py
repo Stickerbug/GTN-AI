@@ -189,3 +189,42 @@ def test_deck_belief_policy_only_augments_public_observation() -> None:
         for card in augmented["opponent_deck_belief"]
     )
     assert policy.diagnostics()["deck_belief_fingerprint"] == policy.prior.fingerprint
+
+
+def test_deck_belief_summarizes_only_public_opponent_evidence() -> None:
+    env = Garden1v1Env(
+        enabled_mods=["Vanilla Cards.gtnmod"],
+        seed=2903,
+        include_pregame=False,
+    )
+    observation = env.reset()
+    opponent_id = int((observation.get("opponent") or {})["player_id"])
+    all_features = DeckPrior({}).observation_features(
+        observation["loadout"]["official_mods"],
+        max_cards_per_type=1 << 20,
+    )
+    observed = all_features[-1]
+    observed_id = observed["def_id"]
+    observation["public_history"] = [
+        {"player": opponent_id, "kind": "play_card", "card_def_id": observed_id},
+        {"player": opponent_id, "kind": "play_card", "card_def_id": observed_id},
+        {"player": 1 - opponent_id, "kind": "play_card", "card_def_id": "private"},
+    ]
+
+    augmented = DeckBeliefPolicy(
+        _RecordingPolicy(),
+        DeckPrior({}),
+        max_cards_per_type=2,
+        include_public_evidence=True,
+    )._augment(observation)
+    matching = [
+        item for item in augmented["opponent_deck_belief"]
+        if item["def_id"] == observed_id
+    ]
+
+    assert len(matching) == 1
+    assert matching[0]["observed"] is True
+    assert matching[0]["evidence_count"] == 2
+    assert matching[0]["evidence_sources"] == ["history"]
+    assert all(item["def_id"] != "private" for item in augmented["opponent_deck_belief"])
+    assert "opponent_deck_belief" not in observation

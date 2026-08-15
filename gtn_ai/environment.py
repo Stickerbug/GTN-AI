@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import random
 from dataclasses import dataclass
+from itertools import combinations, product
 from typing import Any, Iterable, Sequence
 
 from .game_imports import (
@@ -68,6 +69,76 @@ class Garden1v1Env:
         self._choice_signature: tuple[Any, ...] | None = None
         self._pregame_cursor = self.seed & 1
         self._pregame_selections: list[list[int]] = [[], []]
+
+    @classmethod
+    def from_engine(
+        cls,
+        engine,
+        *,
+        game_root=None,
+        seed: int = 0,
+        enabled_mods: Iterable[str] | None = None,
+        public_history: Sequence[dict[str, Any]] | None = None,
+        copy_engine: bool = False,
+    ) -> "Garden1v1Env":
+        """Attach the adapter to an already configured production engine.
+
+        Local human-vs-AI sessions use this path so legal-action generation,
+        search clones, and final execution all share the exact production
+        ruleset.  Callers may keep the live engine attached or request a
+        detached copy for diagnostics.
+        """
+
+        if engine is None:
+            raise ValueError("engine is required")
+        if len(getattr(engine, "players", ()) or ()) != 2:
+            raise ValueError("Garden1v1Env requires a two-player engine")
+
+        env = cls.__new__(cls)
+        env.game_root = configure_game_imports(game_root)
+        env.enabled_mods = None if enabled_mods is None else tuple(enabled_mods)
+        catalog_loadout, catalog_allowed_ids, catalog_mods = load_official_content(
+            env.game_root,
+            env.enabled_mods,
+        )
+        env.seed = int(seed)
+        try:
+            from cards import DECK_SIZE
+
+            env.deck_size = int(DECK_SIZE)
+        except (ImportError, TypeError, ValueError):
+            env.deck_size = 15
+        picks = list(getattr(engine, "opening_event_picks", ()) or ())
+        env.opening_events = tuple(
+            _as_int(picks[index], 1) if index < len(picks) else 1
+            for index in range(2)
+        )
+        env.history_limit = max(1, len(public_history or ()) + 128)
+        env.include_pregame = bool(
+            getattr(engine, "phase", "") in {"event_select", "event_reveal", "draft"}
+        )
+        env.runtime = EngineRuntimeScope(env.seed)
+        env.engine = copy.deepcopy(engine) if copy_engine else engine
+        env.loadout = getattr(engine, "v2_loadout", None) or catalog_loadout
+        env.allowed_card_ids = frozenset(
+            getattr(engine, "allowed_card_ids", ()) or catalog_allowed_ids
+        )
+        env.mod_filenames = tuple(env.enabled_mods or catalog_mods)
+        loadout_hash = (
+            env.loadout.get("loadout_hash", "")
+            if isinstance(env.loadout, dict)
+            else getattr(env.loadout, "loadout_hash", "")
+        )
+        env.loadout_fingerprint = str(loadout_hash or "")[:16]
+        env.ruleset_fingerprint = official_ruleset_fingerprint(env.game_root)
+        env.public_history = copy.deepcopy(list(public_history or ()))
+        env._choice_selection = []
+        env._choice_candidate_ids = []
+        env._choice_signature = None
+        env._pregame_cursor = _as_int(getattr(engine, "current_player", 0), 0) & 1
+        env._pregame_selections = [[], []]
+        env._reset_choice_builder()
+        return env
 
     def reset(self, *, seed: int | None = None) -> dict[str, Any]:
         if seed is not None:
@@ -329,7 +400,7 @@ class Garden1v1Env:
         if self.engine.pending_choice is not None:
             return self._choice_actions(player_id)
         if self.engine.pending_v2_ui is not None:
-            raise UnsupportedDecisionError("an official mod opened an unsupported v2 UI decision")
+            return self._v2_ui_actions(player_id)
         return self._turn_actions(player_id)
 
     def _pregame_actions(self, player_id: int) -> list[Action]:
@@ -861,6 +932,193 @@ class Garden1v1Env:
             actions.append(Action("resolve_choice", {"choice": {"cancelled": True}}))
         return _unique_actions(actions)
 
+    def _v2_ui_actions(self, player_id: int) -> list[Action]:
+        pending = self.engine.pending_v2_ui
+        if not isinstance(pending, dict) or _as_int(pending.get("player_id"), -1) != player_id:
+            return []
+        component = pending.get("component")
+        if not isinstance(component, dict):
+            raise UnsupportedDecisionError("v2 UI request has no component")
+
+        control_variants: list[list[dict[str, Any]]] = []
+        for control_slot, control in enumerate(component.get("controls") or []):
+            if not isinstance(control, dict):
+                continue
+            variants = self._v2_control_variants(control_slot, control)
+            if variants:
+                control_variants.append(variants)
+                continue
+            if str(control.get("type") or "text") not in {
+                "text", "rich_text", "stat_display", "card_preview",
+            }:
+                raise UnsupportedDecisionError(
+                    f"v2 UI control {control.get('type')!r} has no legal value"
+                )
+
+        value_combinations: list[list[dict[str, Any]]] = [[]]
+        if control_variants:
+            value_combinations = []
+            for values in product(*control_variants):
+                value_combinations.append([dict(value) for value in values])
+                if len(value_combinations) >= 256:
+                    break
+
+        buttons = [
+            button for button in (component.get("buttons") or [])
+            if isinstance(button, dict) and button.get("id")
+        ]
+        if not buttons:
+            buttons = [{"id": "confirm", "role": "confirm"}]
+
+        from mod_runtime_v2 import validate_v2_ui_response
+
+        actions: list[Action] = []
+        ordered_button_slots = sorted(
+            range(len(buttons)),
+            key=lambda slot: (
+                str(buttons[slot].get("role") or "") == "cancel"
+                or str(buttons[slot].get("id")) == "cancel",
+                slot,
+            ),
+        )
+        for button_slot in ordered_button_slots:
+            button = buttons[button_slot]
+            is_cancel = (
+                str(button.get("role") or "") == "cancel"
+                or str(button.get("id")) == "cancel"
+            )
+            variants = value_combinations[:1] if is_cancel else value_combinations
+            for controls in variants:
+                action = Action("v2_ui_response", {
+                    "button_slot": int(button_slot),
+                    "button_role": "cancel" if is_cancel else "confirm",
+                    "controls": controls,
+                })
+                try:
+                    response = self._v2_response_payload(action)
+                    validate_v2_ui_response(
+                        self.engine,
+                        pending.get("context") if isinstance(pending.get("context"), dict) else {},
+                        component,
+                        response,
+                    )
+                except Exception:
+                    continue
+                actions.append(action)
+        if not actions:
+            raise UnsupportedDecisionError("v2 UI request has no valid encoded response")
+        return _unique_actions(actions)
+
+    @staticmethod
+    def _v2_control_variants(control_slot: int, control: dict[str, Any]) -> list[dict[str, Any]]:
+        ctype = str(control.get("type") or "text")
+        if ctype in {"text", "rich_text", "stat_display", "card_preview"}:
+            return []
+        if ctype in {"slider", "number", "number_input"}:
+            minimum = float(control.get("min", 0) or 0)
+            maximum = float(control.get("max", minimum) or minimum)
+            step = max(0.000001, float(control.get("step", 1) or 1))
+            default = float(control.get("default", minimum) or minimum)
+            values = [default]
+            step_count = int(round((maximum - minimum) / step)) if maximum >= minimum else 0
+            if 0 <= step_count <= 24:
+                values.extend(minimum + step * offset for offset in range(step_count + 1))
+            else:
+                values.extend((minimum, maximum, minimum + (maximum - minimum) / 2.0))
+            result = []
+            seen: set[float] = set()
+            for value in values:
+                value = min(max(float(value), minimum), maximum)
+                offset = round((value - minimum) / step)
+                value = min(max(minimum + offset * step, minimum), maximum)
+                value = int(value) if float(value).is_integer() else value
+                marker = float(value)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                result.append({"control_slot": int(control_slot), "value": value})
+            return result
+
+        options = [option for option in (control.get("options") or []) if isinstance(option, dict)]
+        if ctype in {"select", "card_catalog_picker", "card_picker", "equipment_picker", "player_picker", "target_picker"}:
+            return [
+                {"control_slot": int(control_slot), "option_slot": int(option_slot)}
+                for option_slot in range(len(options))
+            ]
+        if ctype in {"multi_card_picker", "multi_equipment_picker"}:
+            minimum = max(0, min(len(options), _as_int(control.get("min_select"), 0)))
+            maximum = max(minimum, min(len(options), _as_int(control.get("max_select"), len(options))))
+            sizes = [minimum]
+            if maximum != minimum:
+                sizes.append(maximum)
+                sizes.extend(size for size in range(minimum + 1, maximum) if size not in sizes)
+            result = []
+            for size in sizes:
+                for selected in combinations(range(len(options)), size):
+                    result.append({
+                        "control_slot": int(control_slot),
+                        "option_slots": [int(slot) for slot in selected],
+                    })
+                    if len(result) >= 128:
+                        return result
+            return result
+        return []
+
+    def _v2_response_payload(self, action: Action) -> dict[str, Any]:
+        pending = self.engine.pending_v2_ui
+        if not isinstance(pending, dict):
+            raise IllegalActionError("there is no pending v2 UI request")
+        component = pending.get("component")
+        if not isinstance(component, dict):
+            raise IllegalActionError("v2 UI request has no component")
+        buttons = [
+            button for button in (component.get("buttons") or [])
+            if isinstance(button, dict) and button.get("id")
+        ]
+        if not buttons:
+            buttons = [{"id": "confirm", "role": "confirm"}]
+        button_slot = _as_int(action.payload.get("button_slot"), -1)
+        if button_slot < 0 or button_slot >= len(buttons):
+            raise IllegalActionError("v2 UI button slot is out of range")
+
+        controls = component.get("controls") if isinstance(component.get("controls"), list) else []
+        values: dict[str, Any] = {}
+        encoded_controls = action.payload.get("controls")
+        if not isinstance(encoded_controls, list):
+            encoded_controls = []
+        for encoded in encoded_controls:
+            if not isinstance(encoded, dict):
+                raise IllegalActionError("v2 UI control encoding is invalid")
+            control_slot = _as_int(encoded.get("control_slot"), -1)
+            if control_slot < 0 or control_slot >= len(controls):
+                raise IllegalActionError("v2 UI control slot is out of range")
+            control = controls[control_slot]
+            if not isinstance(control, dict):
+                raise IllegalActionError("v2 UI control is invalid")
+            control_id = str(control.get("id") or "")
+            ctype = str(control.get("type") or "text")
+            if ctype in {"slider", "number", "number_input"}:
+                values[control_id] = encoded.get("value")
+                continue
+            options = [option for option in (control.get("options") or []) if isinstance(option, dict)]
+            if ctype in {"multi_card_picker", "multi_equipment_picker"}:
+                option_slots = encoded.get("option_slots")
+                if not isinstance(option_slots, list):
+                    raise IllegalActionError("v2 UI multi-picker encoding is invalid")
+                resolved = []
+                for raw_slot in option_slots:
+                    option_slot = _as_int(raw_slot, -1)
+                    if option_slot < 0 or option_slot >= len(options):
+                        raise IllegalActionError("v2 UI option slot is out of range")
+                    resolved.append(options[option_slot].get("value"))
+                values[control_id] = resolved
+                continue
+            option_slot = _as_int(encoded.get("option_slot"), -1)
+            if option_slot < 0 or option_slot >= len(options):
+                raise IllegalActionError("v2 UI option slot is out of range")
+            values[control_id] = options[option_slot].get("value")
+        return {"button": str(buttons[button_slot].get("id")), "values": values}
+
     def _execute(self, action: Action, player_id: int) -> dict[str, Any]:
         payload = action.payload
         if self._in_pregame():
@@ -914,6 +1172,15 @@ class Garden1v1Env:
             return {"success": True, "selection_only": True}
         if action.kind == "submit_choice":
             return self.engine.resolve_choice(player_id, self._built_choice_payload())
+        if action.kind == "v2_ui_response":
+            pending = self.engine.pending_v2_ui
+            if not isinstance(pending, dict):
+                raise IllegalActionError("there is no pending v2 UI request")
+            return self.engine.handle_v2_ui_response(
+                player_id,
+                str(pending.get("request_id") or ""),
+                self._v2_response_payload(action),
+            )
         if action.kind == "use_trigger":
             equipment = self._equipment(player_id, payload.get("equipment_slot"))
             return self.engine.use_trigger(
@@ -1155,6 +1422,10 @@ class Garden1v1Env:
         pending = self.engine.pending_choice
         if isinstance(pending, dict):
             context["choice_type"] = str(pending.get("choice_type") or "")
+        pending_v2 = self.engine.pending_v2_ui
+        if isinstance(pending_v2, dict):
+            component = pending_v2.get("component") or {}
+            context["choice_type"] = f"v2:{component.get('type', 'modal')}"
         return context
 
     def _record_public_action(
@@ -1185,7 +1456,7 @@ class Garden1v1Env:
         elif action.kind == "use_trigger":
             event["equipment_def_id"] = str(context.get("equipment_def_id") or "")
             event["target_player"] = _as_int(payload.get("target_player_id"), -1)
-        elif action.kind in {"resolve_choice", "select_choice", "default_choice", "submit_choice"}:
+        elif action.kind in {"resolve_choice", "select_choice", "default_choice", "submit_choice", "v2_ui_response"}:
             event["choice_type"] = str(context.get("choice_type") or "resolved")
         self.public_history.append(event)
         if len(self.public_history) > self.history_limit:

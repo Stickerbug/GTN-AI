@@ -19,6 +19,7 @@
 - 提供结构化 Transformer v2：玩家、状态、装备、牌区、单牌、选择项和历史事件分别编码
 - 可将 v8 的完整动作分布与价值缓存为带版本/权重指纹的张量分片，再反复蒸馏 v2
 - 提供极轻量 HTTP 推理服务，适合以后作为游戏服务器的本机 sidecar
+- 提供面向登录账号的真人对战入口、隔离 AI worker、脱敏决策快照和坏步标记
 - 用全局规则指纹阻止旧模型在卡牌或结算规则更新后静默运行
 - 可审计旧 `.gtnreplay` 是否足以用于严格行为克隆
 
@@ -170,7 +171,21 @@ python -m gtn_ai.train_linear runs\selfplay-v4.jsonl.gz `
 - `rollouts` 是初始样本数；分差低于 `confidence` 时按 `batch` 增加到 `max-rollouts`。
 - `annotate=true` 让基础模型执行动作、搜索只记录教师目标，适合 DAgger 数据采集。
 - `gate=N` 可按基础模型前两名 logit 分差跳过高置信局面，仅用于成本诊断。
+- `crn=true`（默认）让同一轮不同候选共享随机数，降低候选比较方差。
+- 执行搜索默认避免在相同公开状态重复同一动作，并原子完成固定数量选择与牌堆排序；
+  可分别用 `avoid-repeats=false`、`auto-submit=false`、
+  `avoid-choice-backtracking=false` 关闭；注释模式不会应用这些执行约束。
 - 所有 `unsafe-rollout` 策略均为离线工具，推理服务会主动拒绝加载，不能直接上线。
+
+当前验证过的低预算强度配置为：
+
+```powershell
+--policy-a "unsafe-rollout-cpu:models\structured-v2-search-dagger-v2.epoch-06.pt;candidates=3;rollouts=2;horizon=2;belief=true;exploration=0"
+```
+
+它在两批互不重叠、随机官方模组组合并交换座位的 400 局中对启发式得分 79.5%，
+95% 区间为 75.60% 至 83.40%，没有循环恢复或强制兜底。该成绩属于离线混合策略，
+不是 checkpoint 单独推理的成绩。
 
 把记录式搜索标签编码成缓存，并按原始搜索分差过滤：
 
@@ -180,8 +195,12 @@ python -m gtn_ai.train_linear runs\selfplay-v4.jsonl.gz `
   runs\search-dagger-adaptive-p1-20260814.jsonl.gz `
   --config-checkpoint models\structured-v2-search-dagger-v2.epoch-06.pt `
   --min-teacher-margin 0.025 `
+  --only-teacher-disagreements `
   --output datasets\structured-v2-search-adaptive-conf-v1
 ```
+
+`--only-teacher-disagreements` 仅保留搜索教师推翻实际执行动作的局面，适合对稳定模型做
+小步纠错；训练时仍应混入宽覆盖旧缓存，避免遗忘本来已经正确的动作。
 
 蒸馏可混入旧缓存防止策略遗忘，或仅训练策略头：
 
@@ -246,7 +265,8 @@ python -m gtn_ai.arena `
   --policy-a linear:models\hashed-linear-v1.json `
   --policy-b heuristic `
   --sample-mod-combinations `
-  --workers 8
+  --workers 8 `
+  --output .runtime\arena-result.json
 ```
 
 启动本机推理服务：
@@ -282,11 +302,14 @@ python -m gtn_ai.replay_audit "D:\QQ File\GTN-R-12728.gtnreplay"
 - `gtn_ai/arena.py`：座位互换评估、置信区间和近似 Elo
 - `gtn_ai/inference_server.py`：供线性或神经策略使用的本机推理 API
 - `gtn_ai/replay_audit.py`：旧回放训练适用性审计
+- `gtn_ai/diagnostics.py`：本地真人测试的决策、标记和私有快照记录
+- `gtn_ai/diagnostic_data.py`：将合规 `.gtnai.zip` 转换为严格玩家决策数据
+- `gtn_ai/diagnostic_relabel.py`：从可信私有快照生成高预算离线教师标签
 - `gtn_ai/validate_loadouts.py`：遍历官方模组组合
 - `docs/PROTOCOL.md`：观测、动作与信息边界
 - `docs/TRAINING_ROADMAP.md`：从基线到强 AI 的路线
 - `docs/ONLINE_INTEGRATION.md`：未来接入在线游戏的方案
-- `docs/AI_1V1_TEST_GATE.md`：特别致谢内隐藏测试入口的门控边界
+- `docs/AI_1V1_TEST_GATE.md`：公开账号入口、服务器容量和诊断数据边界
 - `docs/VALIDATION.md`：当前规则版本的实测覆盖与结果
 
 ## 当前边界
@@ -296,15 +319,18 @@ python -m gtn_ai.replay_audit "D:\QQ File\GTN-R-12728.gtnreplay"
 3. 这是一个部分可观测博弈。单个确定状态上的搜索不能等同于真正最优策略。
 4. 官方规则或 AI 协议改变后必须重新生成轨迹并训练模型；版本与规则指纹会主动阻止
    误用旧模型。
-5. 多人游戏的 1v1 测试入口目前只有受控门槛，没有接入匹配或机器人席位；它不会改变
-   正式 `1v1` 的规则与匹配队列。
+5. 多人游戏的 1v1 页面已接入面向登录账号的隔离 AI 对局，但仍不进入正式匹配、统计、
+   GR 或奖励。它使用生产引擎；线上 worker 只监听回环地址，默认串行推理并把脱敏诊断
+   保存到独立持久目录。
 6. 当前本机冠军为 `models/champion.pt`（actor-critic v8 GAE）；它在 2400 场全官方模组
    组合、双座位竞技中以 52.17% 得分率超过 v6，并显著超过启发式与历史 v4，但尚未
    接入游戏，也不应被称为理论最优策略。
-7. 当前最强结构化候选为 `models/structured-v2-search-dagger-v2.epoch-06.pt`，在独立
-   200 局中对启发式得分 71.0%，仍未达到 75% 目标，因此没有覆盖任何冠军文件。离线
-   belief 搜索可达到约 81%，但尚不满足线上信息安全与延迟要求；下一阶段应提升学生的
-   特征/架构或训练专用纠错网络，而不是继续对现有结构反复微调。
+7. 当前最强纯结构化候选仍为 `models/structured-v2-search-dagger-v2.epoch-06.pt`；早期
+   独立 200 局为 71.0%，新一批同种子基线为 60.0%，说明纯模型尚未稳定达到 75%。以它
+   为基础的低预算 belief 搜索在两批共 400 局中达到 79.5%。该混合策略已接入 Phelren
+   真人入口，实测首次加载约 4.2 秒、首步搜索约 1.1 秒；当前只用于不计分的人机对局，
+   不能用作正式匹配机器人。下一阶段优先用自动候选和真人标记的坏步重算搜索标签，再
+   蒸馏回低延迟学生。
 
 早期 `runs/final-validation.jsonl.gz` 与 `models/final-validation.json` 属于旧战斗协议，
 已不能由当前协议加载；它们只曾用于确认链路，不是准备上线的强模型。

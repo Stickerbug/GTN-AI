@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import random
 import time
+from dataclasses import replace
 from itertools import islice
 from pathlib import Path
 from typing import Any, Sequence
@@ -21,7 +22,9 @@ from .structured_model import (
     StructuredPolicy,
     StructuredPolicyNetwork,
     collate_structured_decisions,
+    expand_structured_model,
     load_structured_checkpoint,
+    structured_feature_layout_compatible,
 )
 
 
@@ -38,9 +41,14 @@ def train_structured_distillation(
     soft_policy_weight: float = 1.0,
     hard_policy_weight: float = 0.1,
     value_loss_weight: float = 0.25,
+    teacher_margin_weight_power: float = 0.0,
+    teacher_margin_weight_floor: float = 1.0,
+    teacher_margin_weight_reference: float = 1.0,
     max_grad_norm: float = 1.0,
     validation_fraction: float = 0.05,
     initial_checkpoint: str | Path | None = None,
+    model_state_layers: int | None = None,
+    model_action_layers: int | None = None,
     replay_cache_dir: str | Path | None = None,
     replay_ratio: float = 0.0,
     trainable_scope: str = "all",
@@ -50,8 +58,27 @@ def train_structured_distillation(
     show_progress: bool = True,
 ) -> tuple[StructuredPolicy, dict[str, Any]]:
     require_torch()
+    if float(teacher_margin_weight_power) < 0.0:
+        raise ValueError("teacher margin weight power must be non-negative")
+    if not 0.0 < float(teacher_margin_weight_floor) <= 1.0:
+        raise ValueError("teacher margin weight floor must be in (0, 1]")
+    if float(teacher_margin_weight_reference) <= 0.0:
+        raise ValueError("teacher margin weight reference must be positive")
     manifest = load_cache_manifest(cache_dir)
-    config = StructuredModelConfig.from_dict(manifest.get("structured_config") or {})
+    cache_config = StructuredModelConfig.from_dict(manifest.get("structured_config") or {})
+    config = replace(
+        cache_config,
+        state_layers=(
+            int(model_state_layers)
+            if model_state_layers is not None
+            else cache_config.state_layers
+        ),
+        action_layers=(
+            int(model_action_layers)
+            if model_action_layers is not None
+            else cache_config.action_layers
+        ),
+    )
     normalized_replay_ratio = max(0.0, float(replay_ratio))
     if normalized_replay_ratio > 0.0 and replay_cache_dir is None:
         raise ValueError("replay ratio requires a replay cache")
@@ -64,23 +91,42 @@ def train_structured_distillation(
         replay_config = StructuredModelConfig.from_dict(
             replay_manifest.get("structured_config") or {}
         )
-        if replay_config != config:
-            raise ValueError("replay cache structured config does not match primary cache")
+        if replay_config.feature_config != cache_config.feature_config:
+            raise ValueError("replay cache feature config does not match primary cache")
         if replay_manifest["ruleset_fingerprint"] != manifest["ruleset_fingerprint"]:
             raise ValueError("replay cache ruleset does not match primary cache")
+        if replay_manifest.get("deck_prior_fingerprint") != manifest.get(
+            "deck_prior_fingerprint"
+        ):
+            raise ValueError("replay cache deck prior does not match primary cache")
+        if replay_manifest.get("deck_belief_schema_version") != manifest.get(
+            "deck_belief_schema_version"
+        ):
+            raise ValueError("replay cache deck belief schema does not match primary cache")
     resolved_device = resolve_device(device)
     torch.manual_seed(int(seed))
     if resolved_device == "xpu" and hasattr(torch, "xpu"):
         torch.xpu.manual_seed_all(int(seed))
     elif resolved_device == "cuda":
         torch.cuda.manual_seed_all(int(seed))
+    initialization_report = None
     if initial_checkpoint:
         initial = load_structured_checkpoint(initial_checkpoint, device=resolved_device)
-        if initial["config"] != config:
-            raise ValueError("initial structured checkpoint config does not match cache")
+        if not structured_feature_layout_compatible(initial["config"], cache_config):
+            raise ValueError(
+                "initial structured checkpoint feature layout does not match cache"
+            )
         if initial["ruleset_fingerprint"] != manifest["ruleset_fingerprint"]:
             raise ValueError("initial structured checkpoint ruleset does not match cache")
-        model = initial["model"]
+        if initial["config"] == config:
+            model = initial["model"]
+        else:
+            model, initialization_report = expand_structured_model(
+                initial["model"],
+                source_config=initial["config"],
+                target_config=config,
+            )
+            model.to(torch.device(resolved_device))
     else:
         model = StructuredPolicyNetwork(config).to(torch.device(resolved_device))
     trainable_parameters = _configure_trainable_parameters(model, trainable_scope)
@@ -179,6 +225,9 @@ def train_structured_distillation(
                 soft_policy_weight=soft_policy_weight,
                 hard_policy_weight=hard_policy_weight,
                 value_loss_weight=value_loss_weight,
+                teacher_margin_weight_power=teacher_margin_weight_power,
+                teacher_margin_weight_floor=teacher_margin_weight_floor,
+                teacher_margin_weight_reference=teacher_margin_weight_reference,
             )
             if not torch.isfinite(loss):
                 raise RuntimeError("structured distillation produced a non-finite loss")
@@ -215,6 +264,9 @@ def train_structured_distillation(
             soft_policy_weight=soft_policy_weight,
             hard_policy_weight=hard_policy_weight,
             value_loss_weight=value_loss_weight,
+            teacher_margin_weight_power=teacher_margin_weight_power,
+            teacher_margin_weight_floor=teacher_margin_weight_floor,
+            teacher_margin_weight_reference=teacher_margin_weight_reference,
             device=resolved_device,
         ) if validation_fraction > 0 else {}
         epoch_metrics.append({
@@ -244,9 +296,13 @@ def train_structured_distillation(
             soft_policy_weight=soft_policy_weight,
             hard_policy_weight=hard_policy_weight,
             value_loss_weight=value_loss_weight,
+            teacher_margin_weight_power=teacher_margin_weight_power,
+            teacher_margin_weight_floor=teacher_margin_weight_floor,
+            teacher_margin_weight_reference=teacher_margin_weight_reference,
             max_grad_norm=max_grad_norm,
             validation_fraction=validation_fraction,
             seed=seed,
+            initialization_report=initialization_report,
         )
         snapshot = StructuredPolicy(
             model,
@@ -292,9 +348,13 @@ def train_structured_distillation(
         soft_policy_weight=soft_policy_weight,
         hard_policy_weight=hard_policy_weight,
         value_loss_weight=value_loss_weight,
+        teacher_margin_weight_power=teacher_margin_weight_power,
+        teacher_margin_weight_floor=teacher_margin_weight_floor,
+        teacher_margin_weight_reference=teacher_margin_weight_reference,
         max_grad_norm=max_grad_norm,
         validation_fraction=validation_fraction,
         seed=seed,
+        initialization_report=initialization_report,
     )
     policy.save(output_checkpoint, metadata=metrics)
     return policy, metrics
@@ -323,9 +383,13 @@ def _training_metadata(
     soft_policy_weight: float,
     hard_policy_weight: float,
     value_loss_weight: float,
+    teacher_margin_weight_power: float,
+    teacher_margin_weight_floor: float,
+    teacher_margin_weight_reference: float,
     max_grad_norm: float,
     validation_fraction: float,
     seed: int,
+    initialization_report: dict[str, Any] | None,
 ) -> dict[str, Any]:
     return {
         "objective": "v8_teacher_structured_policy_distillation",
@@ -335,6 +399,8 @@ def _training_metadata(
         "seconds": round(float(seconds), 3),
         "cache_dir": str(Path(cache_dir).resolve()),
         "cache_fingerprint": manifest["cache_fingerprint"],
+        "deck_prior_fingerprint": manifest.get("deck_prior_fingerprint"),
+        "deck_belief_schema_version": manifest.get("deck_belief_schema_version"),
         "teacher_fingerprint": manifest["teacher_fingerprint"],
         "teacher_name": manifest.get("teacher_name"),
         "examples": int((manifest.get("counters") or {}).get("examples", 0)),
@@ -345,6 +411,13 @@ def _training_metadata(
         "initial_checkpoint": (
             str(Path(initial_checkpoint).resolve()) if initial_checkpoint else None
         ),
+        "initialization": initialization_report,
+        "model_config": {
+            "state_layers": int(model.config.state_layers),
+            "action_layers": int(model.config.action_layers),
+            "model_dim": int(model.config.model_dim),
+            "feedforward_dim": int(model.config.feedforward_dim),
+        },
         "replay_cache": (
             {
                 "cache_dir": str(Path(replay_cache_dir).resolve()),
@@ -365,6 +438,9 @@ def _training_metadata(
             "soft_policy_weight": float(soft_policy_weight),
             "hard_policy_weight": float(hard_policy_weight),
             "value_loss_weight": float(value_loss_weight),
+            "teacher_margin_weight_power": float(teacher_margin_weight_power),
+            "teacher_margin_weight_floor": float(teacher_margin_weight_floor),
+            "teacher_margin_weight_reference": float(teacher_margin_weight_reference),
             "max_grad_norm": float(max_grad_norm),
             "validation_fraction": float(validation_fraction),
             "replay_ratio": float(replay_ratio),
@@ -447,6 +523,11 @@ def collate_distillation_examples(
         dtype=torch.float32,
         device=tensor_device,
     )
+    batch["example_weights"] = torch.tensor(
+        [item.example_weight for item in items],
+        dtype=torch.float32,
+        device=tensor_device,
+    )
     return batch
 
 
@@ -461,6 +542,9 @@ def evaluate_structured_distillation(
     soft_policy_weight: float,
     hard_policy_weight: float,
     value_loss_weight: float,
+    teacher_margin_weight_power: float,
+    teacher_margin_weight_floor: float,
+    teacher_margin_weight_reference: float,
     device: str,
 ) -> dict[str, Any]:
     model.eval()
@@ -490,6 +574,9 @@ def evaluate_structured_distillation(
                 soft_policy_weight=soft_policy_weight,
                 hard_policy_weight=hard_policy_weight,
                 value_loss_weight=value_loss_weight,
+                teacher_margin_weight_power=teacher_margin_weight_power,
+                teacher_margin_weight_floor=teacher_margin_weight_floor,
+                teacher_margin_weight_reference=teacher_margin_weight_reference,
             )
             accumulator.add(len(examples_batch), stats, 0.0)
     return accumulator.summary()
@@ -504,6 +591,9 @@ def _distillation_loss(
     soft_policy_weight: float,
     hard_policy_weight: float,
     value_loss_weight: float,
+    teacher_margin_weight_power: float = 0.0,
+    teacher_margin_weight_floor: float = 1.0,
+    teacher_margin_weight_reference: float = 1.0,
 ):
     scale = max(1e-6, float(temperature))
     mask = batch["action_mask"]
@@ -514,14 +604,28 @@ def _distillation_loss(
     student_log_probs = torch.nn.functional.log_softmax(student_scaled, dim=1)
     teacher_log_probs = torch.nn.functional.log_softmax(teacher_scaled, dim=1)
     teacher_probs = teacher_log_probs.exp()
-    soft_loss = (
+    soft_loss_per_example = (
         teacher_probs * (teacher_log_probs - student_log_probs)
-    ).masked_fill(~mask, 0.0).sum(dim=1).mean() * (scale * scale)
+    ).masked_fill(~mask, 0.0).sum(dim=1) * (scale * scale)
     teacher_targets = teacher_logits.masked_fill(~mask, -1e9).argmax(dim=1)
-    hard_loss = torch.nn.functional.cross_entropy(
-        student_logits.masked_fill(~mask, -1e9), teacher_targets
+    hard_loss_per_example = torch.nn.functional.cross_entropy(
+        student_logits.masked_fill(~mask, -1e9), teacher_targets, reduction="none"
     )
-    value_loss = torch.nn.functional.mse_loss(values, batch["teacher_values"])
+    example_weights = _teacher_margin_weights(
+        teacher_logits,
+        mask,
+        power=teacher_margin_weight_power,
+        floor=teacher_margin_weight_floor,
+        reference=teacher_margin_weight_reference,
+    ) * batch.get(
+        "example_weights",
+        torch.ones_like(teacher_targets, dtype=teacher_logits.dtype),
+    ).to(teacher_logits.dtype)
+    weight_total = example_weights.sum().clamp_min(1e-6)
+    soft_loss = (soft_loss_per_example * example_weights).sum() / weight_total
+    hard_loss = (hard_loss_per_example * example_weights).sum() / weight_total
+    value_loss_per_example = (values - batch["teacher_values"]).square()
+    value_loss = (value_loss_per_example * example_weights).sum() / weight_total
     total = (
         float(soft_policy_weight) * soft_loss
         + float(hard_policy_weight) * hard_loss
@@ -529,6 +633,9 @@ def _distillation_loss(
     )
     student_targets = student_logits.masked_fill(~mask, -1e9).argmax(dim=1)
     agreement = (student_targets == teacher_targets).float().mean()
+    weighted_agreement = (
+        (student_targets == teacher_targets).to(example_weights.dtype) * example_weights
+    ).sum() / weight_total
     teacher_entropy = -(
         teacher_probs * teacher_log_probs
     ).masked_fill(~mask, 0.0).sum(dim=1).mean()
@@ -540,8 +647,37 @@ def _distillation_loss(
         "value_loss": float(value_loss.detach().to("cpu").item()),
         "value_rmse": float(value_rmse.detach().to("cpu").item()),
         "teacher_agreement": float(agreement.detach().to("cpu").item()),
+        "weighted_teacher_agreement": float(
+            weighted_agreement.detach().to("cpu").item()
+        ),
+        "mean_teacher_weight": float(example_weights.mean().detach().to("cpu").item()),
         "teacher_entropy": float(teacher_entropy.detach().to("cpu").item()),
     }
+
+
+def _teacher_margin_weights(
+    teacher_logits,
+    mask,
+    *,
+    power: float,
+    floor: float,
+    reference: float,
+):
+    if float(power) <= 0.0 or float(floor) >= 1.0:
+        return torch.ones(
+            teacher_logits.shape[0],
+            dtype=teacher_logits.dtype,
+            device=teacher_logits.device,
+        )
+    masked = teacher_logits.masked_fill(~mask, -1e9)
+    top_count = min(2, masked.shape[1])
+    top_values = masked.topk(top_count, dim=1).values
+    if top_count == 1:
+        margins = torch.full_like(top_values[:, 0], float(reference))
+    else:
+        margins = (top_values[:, 0] - top_values[:, 1]).clamp_min(0.0)
+    confidence = (margins / float(reference)).clamp(0.0, 1.0).pow(float(power))
+    return float(floor) + (1.0 - float(floor)) * confidence
 
 
 class _DistillationAccumulator:
@@ -555,6 +691,8 @@ class _DistillationAccumulator:
             "value_loss": 0.0,
             "value_rmse": 0.0,
             "teacher_agreement": 0.0,
+            "weighted_teacher_agreement": 0.0,
+            "mean_teacher_weight": 0.0,
             "teacher_entropy": 0.0,
             "gradient_norm": 0.0,
         }

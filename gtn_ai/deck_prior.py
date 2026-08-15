@@ -15,6 +15,7 @@ from .historical_aggregate import HISTORICAL_AGGREGATE_SCHEMA_VERSION
 
 
 DECK_PRIOR_SCHEMA_VERSION = 1
+DECK_BELIEF_FEATURE_SCHEMA_VERSION = 2
 GLOBAL_DECK_BUCKET = "*"
 
 
@@ -194,6 +195,60 @@ class DeckPrior:
         self._belief_feature_cache[cache_key] = frozen
         return [dict(value) for value in frozen]
 
+    def public_observation_features(
+        self,
+        observation: dict[str, Any],
+        *,
+        max_cards_per_type: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Summarize the population prior conditioned only on public evidence."""
+
+        loadout = observation.get("loadout") or {}
+        official_mods = loadout.get("official_mods") or ()
+        evidence = _public_opponent_card_evidence(observation)
+        if not evidence:
+            return self.observation_features(
+                official_mods,
+                max_cards_per_type=max_cards_per_type,
+            )
+
+        # The complete distribution is small (currently below a few hundred
+        # cards) and cached by observation_features. It lets observed cards
+        # survive even when they were outside the static top-k prior.
+        population = self.observation_features(
+            official_mods,
+            max_cards_per_type=1 << 20,
+        )
+        by_type: dict[str, list[dict[str, Any]]] = {}
+        for feature in population:
+            by_type.setdefault(str(feature.get("card_type") or ""), []).append(feature)
+
+        limit = max(1, int(max_cards_per_type))
+        result: list[dict[str, Any]] = []
+        for card_type, features in by_type.items():
+            observed = [
+                feature for feature in features
+                if str(feature.get("def_id") or "") in evidence
+            ]
+            unobserved = [
+                feature for feature in features
+                if str(feature.get("def_id") or "") not in evidence
+            ]
+            selected = observed + unobserved[:max(0, limit - len(observed))]
+            for rank, feature in enumerate(selected):
+                def_id = str(feature.get("def_id") or "")
+                item = dict(feature)
+                item["rank"] = rank
+                card_evidence = evidence.get(def_id)
+                if card_evidence is not None:
+                    item.update({
+                        "observed": True,
+                        "evidence_count": int(card_evidence["count"]),
+                        "evidence_sources": sorted(card_evidence["sources"]),
+                    })
+                result.append(item)
+        return result
+
     def _related_distribution(
         self,
         mod_ids: Sequence[str],
@@ -290,10 +345,12 @@ class DeckBeliefPolicy:
         *,
         name: str | None = None,
         max_cards_per_type: int = 5,
+        include_public_evidence: bool = False,
     ) -> None:
         self.base_policy = base_policy
         self.prior = prior
         self.max_cards_per_type = max(1, int(max_cards_per_type))
+        self.include_public_evidence = bool(include_public_evidence)
         self.name = name or f"{base_policy.name}+deck-belief"
         self.ruleset_fingerprint = str(
             getattr(base_policy, "ruleset_fingerprint", "") or ""
@@ -313,6 +370,7 @@ class DeckBeliefPolicy:
             observation,
             self.prior,
             max_cards_per_type=self.max_cards_per_type,
+            include_public_evidence=self.include_public_evidence,
         )
 
     def select_action(self, observation, legal_actions):
@@ -345,6 +403,7 @@ class DeckBeliefPolicy:
             self.prior,
             name=name or self.name,
             max_cards_per_type=self.max_cards_per_type,
+            include_public_evidence=self.include_public_evidence,
         )
 
     def diagnostics(self) -> dict[str, Any]:
@@ -354,6 +413,11 @@ class DeckBeliefPolicy:
             "policy": self.name,
             "offline_only": self.offline_only,
             "deck_belief_fingerprint": self.prior.fingerprint,
+            "deck_belief_schema_version": (
+                DECK_BELIEF_FEATURE_SCHEMA_VERSION
+                if self.include_public_evidence
+                else None
+            ),
         })
         return result
 
@@ -578,14 +642,90 @@ def augment_observation_with_deck_prior(
     prior: DeckPrior,
     *,
     max_cards_per_type: int = 5,
+    include_public_evidence: bool = False,
 ) -> dict[str, Any]:
     result = dict(observation)
-    loadout = observation.get("loadout") or {}
-    result["opponent_deck_belief"] = prior.observation_features(
-        loadout.get("official_mods") or (),
-        max_cards_per_type=max_cards_per_type,
-    )
+    if include_public_evidence:
+        features = prior.public_observation_features(
+            observation,
+            max_cards_per_type=max_cards_per_type,
+        )
+    else:
+        loadout = observation.get("loadout") or {}
+        features = prior.observation_features(
+            loadout.get("official_mods") or (),
+            max_cards_per_type=max_cards_per_type,
+        )
+    result["opponent_deck_belief"] = features
     return result
+
+
+def _public_opponent_card_evidence(
+    observation: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    opponent = observation.get("opponent") or {}
+    opponent_id = _optional_int(opponent.get("player_id"))
+    if opponent_id is None:
+        seat = _optional_int(observation.get("seat"))
+        opponent_id = None if seat is None else 1 - seat
+    if opponent_id is None:
+        return {}
+
+    evidence: dict[str, dict[str, Any]] = {}
+
+    def record(def_id: Any, source: str) -> None:
+        card_id = str(def_id or "")
+        if not card_id:
+            return
+        item = evidence.setdefault(card_id, {"count": 0, "sources": set()})
+        item["count"] += 1
+        item["sources"].add(source)
+
+    history = observation.get("public_history")
+    if isinstance(history, list):
+        for event in history:
+            if not isinstance(event, dict):
+                continue
+            if _optional_int(event.get("player")) != opponent_id:
+                continue
+            if str(event.get("kind") or "") in {"play_card", "respond"}:
+                record(event.get("card_def_id"), "history")
+
+    for card in opponent.get("revealed_hand") or ():
+        if isinstance(card, dict):
+            record(card.get("def_id"), "revealed_hand")
+    for zone in ("deck_ordered", "discard_ordered"):
+        for card in opponent.get(zone) or ():
+            if isinstance(card, dict):
+                record(card.get("def_id"), zone)
+
+    for relation in ("self", "opponent"):
+        player = observation.get(relation) or {}
+        for equipment in player.get("equipment") or ():
+            if not isinstance(equipment, dict):
+                continue
+            if _optional_int(equipment.get("owner")) != opponent_id:
+                continue
+            card = equipment.get("card") or {}
+            if isinstance(card, dict):
+                record(card.get("def_id"), "equipment")
+
+    for reveal in observation.get("temporary_reveals") or ():
+        if not isinstance(reveal, dict):
+            continue
+        if _optional_int(reveal.get("target_player")) != opponent_id:
+            continue
+        for card in reveal.get("cards") or ():
+            if isinstance(card, dict):
+                record(card.get("def_id"), "initial_deck_reveal")
+    return evidence
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _bucket_mod_sets(

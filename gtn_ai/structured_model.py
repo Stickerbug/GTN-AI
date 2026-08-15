@@ -46,6 +46,7 @@ class StructuredModelConfig:
     action_layers: int = 2
     feedforward_dim: int = 768
     dropout: float = 0.08
+    contextual_value_features: bool = False
 
     def __post_init__(self) -> None:
         for name in (
@@ -75,12 +76,101 @@ class StructuredModelConfig:
             numeric_buckets=self.numeric_buckets,
             max_state_tokens=self.max_state_tokens,
             max_history_events=self.max_history_events,
+            contextual_value_features=self.contextual_value_features,
         )
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "StructuredModelConfig":
         allowed = set(cls.__dataclass_fields__)
         return cls(**{key: value[key] for key in allowed if key in value})
+
+
+def expand_structured_model(
+    source_model: "StructuredPolicyNetwork",
+    *,
+    source_config: StructuredModelConfig,
+    target_config: StructuredModelConfig,
+) -> tuple["StructuredPolicyNetwork", dict[str, Any]]:
+    """Add identity-initialized Transformer layers without changing outputs."""
+
+    require_torch()
+    if not structured_feature_layout_compatible(source_config, target_config):
+        raise ValueError(
+            "expanded structured model must preserve tensor feature dimensions"
+        )
+    shared_fields = ("model_dim", "num_heads", "feedforward_dim", "dropout")
+    if any(getattr(source_config, name) != getattr(target_config, name) for name in shared_fields):
+        raise ValueError("expanded structured model may only change layer counts")
+    if (
+        target_config.state_layers < source_config.state_layers
+        or target_config.action_layers < source_config.action_layers
+    ):
+        raise ValueError("expanded structured model cannot remove layers")
+
+    target_model = StructuredPolicyNetwork(target_config)
+    for layer in target_model.state_encoder.layers[source_config.state_layers:]:
+        _initialize_residual_layer_as_identity(layer)
+    for layer in target_model.action_decoder.layers[source_config.action_layers:]:
+        _initialize_residual_layer_as_identity(layer)
+
+    source_state = source_model.state_dict()
+    target_state = target_model.state_dict()
+    copied = []
+    for key, source_value in source_state.items():
+        target_value = target_state.get(key)
+        if target_value is None or tuple(target_value.shape) != tuple(source_value.shape):
+            continue
+        target_state[key] = source_value.detach().to(device=target_value.device)
+        copied.append(key)
+    target_model.load_state_dict(target_state, strict=True)
+    return target_model, {
+        "copied_tensors": len(copied),
+        "source_state_layers": int(source_config.state_layers),
+        "target_state_layers": int(target_config.state_layers),
+        "source_action_layers": int(source_config.action_layers),
+        "target_action_layers": int(target_config.action_layers),
+        "identity_state_layers": int(target_config.state_layers - source_config.state_layers),
+        "identity_action_layers": int(target_config.action_layers - source_config.action_layers),
+        "contextual_value_features_changed": bool(
+            source_config.contextual_value_features
+            != target_config.contextual_value_features
+        ),
+    }
+
+
+def structured_feature_layout_compatible(
+    source_config: StructuredModelConfig,
+    target_config: StructuredModelConfig,
+) -> bool:
+    """Return whether model tensors can be reused across feature configs."""
+
+    layout_fields = (
+        "categorical_buckets",
+        "categorical_slots",
+        "numeric_buckets",
+        "max_state_tokens",
+        "max_history_events",
+    )
+    return all(
+        getattr(source_config, field) == getattr(target_config, field)
+        for field in layout_fields
+    )
+
+
+def _initialize_residual_layer_as_identity(layer: Any) -> None:
+    with torch.no_grad():
+        attention_modules = [getattr(layer, "self_attn", None)]
+        if hasattr(layer, "multihead_attn"):
+            attention_modules.append(layer.multihead_attn)
+        for attention in attention_modules:
+            if attention is None:
+                continue
+            attention.out_proj.weight.zero_()
+            if attention.out_proj.bias is not None:
+                attention.out_proj.bias.zero_()
+        layer.linear2.weight.zero_()
+        if layer.linear2.bias is not None:
+            layer.linear2.bias.zero_()
 
 
 def collate_structured_decisions(
