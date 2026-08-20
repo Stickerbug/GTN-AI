@@ -17,8 +17,8 @@ from typing import Any
 
 from .diagnostics import DiagnosticSessionRecorder, cleanup_diagnostic_storage
 from .environment import Garden1v1Env
-from .game_imports import configure_game_imports
-from .policies import policy_from_name
+from .game_imports import configure_game_imports, official_ruleset_fingerprint
+from .policies import HeuristicPolicy, policy_from_name
 from .protocol import Action
 
 
@@ -27,6 +27,53 @@ DEFAULT_POLICY = (
     "unsafe-rollout-cpu:{checkpoint};candidates=3;rollouts=2;"
     "horizon=2;belief=true;exploration=0"
 )
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _policy_graph(root) -> list[Any]:
+    """Return policy wrappers and leaves without depending on concrete classes."""
+
+    found: list[Any] = []
+    pending = [root]
+    seen: set[int] = set()
+    while pending:
+        policy = pending.pop()
+        if policy is None or id(policy) in seen:
+            continue
+        seen.add(id(policy))
+        found.append(policy)
+        for name in ("base_policy", "policy"):
+            child = getattr(policy, name, None)
+            if child is not None:
+                pending.append(child)
+        for name in ("policies", "members"):
+            children = getattr(policy, name, None)
+            if isinstance(children, (list, tuple)):
+                pending.extend(children)
+    return found
+
+
+def _policy_ruleset_fingerprints(policy) -> tuple[str, ...]:
+    return tuple(sorted({
+        str(getattr(item, "ruleset_fingerprint", "") or "")
+        for item in _policy_graph(policy)
+        if str(getattr(item, "ruleset_fingerprint", "") or "")
+    }))
+
+
+def _allow_policy_ruleset_mismatch(policy) -> None:
+    # Checkpoint schema and state-dict shape remain strictly validated when the
+    # model is loaded. The live worker may relax only the content fingerprint,
+    # which changes after ordinary card balance updates.
+    for item in _policy_graph(policy):
+        if hasattr(item, "ruleset_fingerprint"):
+            item.ruleset_fingerprint = ""
 
 
 def default_policy_name() -> str:
@@ -68,6 +115,7 @@ class LiveDecisionService:
         retention_days: float = 14.0,
         max_diagnostic_bytes: int = 2 * 1024 * 1024 * 1024,
         export_finished: bool = True,
+        allow_ruleset_mismatch: bool = True,
     ) -> None:
         self.policy_name = str(policy_name)
         self.game_root = Path(game_root).resolve()
@@ -80,14 +128,28 @@ class LiveDecisionService:
         self.retention_days = max(0.0, float(retention_days))
         self.max_diagnostic_bytes = max(0, int(max_diagnostic_bytes))
         self.export_finished = bool(export_finished)
+        self.allow_ruleset_mismatch = bool(allow_ruleset_mismatch)
         self._policies: OrderedDict[str, Any] = OrderedDict()
         self._recorders: dict[str, DiagnosticSessionRecorder] = {}
         self._lock = threading.RLock()
+        self._decision_count = 0
+        self._fallback_count = 0
+        self._last_policy_error = ""
 
         self._cleanup_storage()
         # Load large checkpoint weights once. Session policies fork only RNG and
         # search bookkeeping while sharing the immutable inference network.
         self._policy_template = policy_from_name(self.policy_name, seed=0)
+        self.model_ruleset_fingerprints = _policy_ruleset_fingerprints(
+            self._policy_template
+        )
+        self.current_ruleset_fingerprint = official_ruleset_fingerprint(self.game_root)
+        self.ruleset_mismatch = bool(
+            self.model_ruleset_fingerprints
+            and self.current_ruleset_fingerprint not in self.model_ruleset_fingerprints
+        )
+        if self.ruleset_mismatch and self.allow_ruleset_mismatch:
+            _allow_policy_ruleset_mismatch(self._policy_template)
 
     def _policy_for(self, session_id: str, *, seed: int):
         with self._lock:
@@ -101,6 +163,8 @@ class LiveDecisionService:
                 if callable(fork)
                 else policy_from_name(self.policy_name, seed=int(seed))
             )
+            if self.ruleset_mismatch and self.allow_ruleset_mismatch:
+                _allow_policy_ruleset_mismatch(policy)
             self._policies[session_id] = policy
             while len(self._policies) > self.max_sessions:
                 stale_id, _ = self._policies.popitem(last=False)
@@ -169,17 +233,38 @@ class LiveDecisionService:
         legal_actions = _filter_unambiguous_bad_targets(observation, legal_actions)
         policy = self._policy_for(session_id, seed=int(request.get("seed", 0) or 0))
         started = time.perf_counter()
-        if hasattr(policy, "select_action_with_env"):
-            action = policy.select_action_with_env(
-                env,
+        policy_error = ""
+        try:
+            if hasattr(policy, "select_action_with_env"):
+                action = policy.select_action_with_env(
+                    env,
+                    observation,
+                    legal_actions,
+                    player_id,
+                )
+            else:
+                action = policy.select_action(observation, legal_actions)
+        except Exception as exc:
+            # A stale checkpoint or one unsupported card must not turn Phelren
+            # into an opponent that silently skips every turn.
+            policy_error = f"{type(exc).__name__}: {exc}"
+            action = HeuristicPolicy(seed=int(request.get("seed", 0) or 0)).select_action(
                 observation,
                 legal_actions,
-                player_id,
             )
-        else:
-            action = policy.select_action(observation, legal_actions)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         metadata = getattr(policy, "last_search_metadata", None)
+        if policy_error:
+            metadata = {
+                **dict(metadata or {}),
+                "fallback_policy": "heuristic",
+                "policy_error": policy_error,
+            }
+        with self._lock:
+            self._decision_count += 1
+            if policy_error:
+                self._fallback_count += 1
+                self._last_policy_error = policy_error
         if request.get("record", True):
             recorder = self._recorder_for(
                 session_id,
@@ -220,7 +305,20 @@ class LiveDecisionService:
             "next_player": next_player,
             "terminated": bool(getattr(env.engine, "game_over", False)),
             "step_info": step_info,
+            "fallback": bool(policy_error),
         }
+
+    def health(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "decision_count": self._decision_count,
+                "fallback_count": self._fallback_count,
+                "last_policy_error": self._last_policy_error,
+                "allow_ruleset_mismatch": self.allow_ruleset_mismatch,
+                "ruleset_mismatch": self.ruleset_mismatch,
+                "model_ruleset_fingerprints": list(self.model_ruleset_fingerprints),
+                "current_ruleset_fingerprint": self.current_ruleset_fingerprint,
+            }
 
     def record(self, request: dict[str, Any]) -> dict[str, Any]:
         session_id = str(request.get("session_id") or "").strip()
@@ -550,7 +648,11 @@ class LiveWorkerHandler(BaseHTTPRequestHandler):
         if self.path != "/health" or not self._authorized():
             self._reply(404, {"success": False, "error": "not found"})
             return
-        self._reply(200, {"success": True, "status": "ready"})
+        self._reply(200, {
+            "success": True,
+            "status": "ready",
+            **self.server.service.health(),
+        })
 
     def do_POST(self) -> None:
         if not self._authorized():
@@ -602,6 +704,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=2 * 1024 * 1024 * 1024,
     )
     parser.add_argument("--export-finished", action="store_true")
+    parser.add_argument(
+        "--strict-ruleset",
+        action="store_true",
+        default=_env_bool("GTN_AI_STRICT_RULESET", False),
+        help="enforce the checkpoint card/rules fingerprint during live decisions",
+    )
     return parser
 
 
@@ -620,6 +728,7 @@ def main(argv: list[str] | None = None) -> int:
         retention_days=args.retention_days,
         max_diagnostic_bytes=args.max_diagnostic_bytes,
         export_finished=args.export_finished,
+        allow_ruleset_mismatch=not args.strict_ruleset,
     )
     server = _WorkerServer((args.host, args.port), LiveWorkerHandler, token=token, service=service)
     ready_file = Path(args.ready_file)

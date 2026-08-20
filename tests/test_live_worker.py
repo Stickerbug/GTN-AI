@@ -1,6 +1,7 @@
 import gzip
 import pickle
 
+import gtn_ai.live_worker as live_worker
 from gtn_ai.diagnostics import read_jsonl
 from gtn_ai.environment import Garden1v1Env
 from gtn_ai.live_worker import (
@@ -46,6 +47,65 @@ def test_live_worker_decides_and_records_with_a_production_snapshot(tmp_path) ->
         "outcome": {"winner": actor},
     })
     assert finished["export"].endswith(".gtnai.zip")
+
+
+def test_live_worker_relaxes_only_policy_ruleset_fingerprints() -> None:
+    class Leaf:
+        ruleset_fingerprint = "trained-rules"
+
+    class Wrapper:
+        ruleset_fingerprint = "trained-rules"
+        base_policy = Leaf()
+
+    policy = Wrapper()
+    assert live_worker._policy_ruleset_fingerprints(policy) == ("trained-rules",)
+
+    live_worker._allow_policy_ruleset_mismatch(policy)
+
+    assert policy.ruleset_fingerprint == ""
+    assert policy.base_policy.ruleset_fingerprint == ""
+
+
+def test_live_worker_uses_a_legal_heuristic_action_when_policy_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class BrokenPolicy:
+        name = "broken-policy"
+        last_search_metadata = None
+
+        def select_action(self, _observation, _legal_actions):
+            raise RuntimeError("test model failure")
+
+    env = Garden1v1Env(
+        seed=37,
+        enabled_mods=["Vanilla Cards.gtnmod"],
+        include_pregame=False,
+    )
+    env.reset()
+    actor = env.decision_player()
+    monkeypatch.setattr(live_worker, "policy_from_name", lambda *_args, **_kwargs: BrokenPolicy())
+    service = LiveDecisionService(
+        policy_name="broken",
+        game_root=env.game_root,
+        diagnostics_root=tmp_path,
+    )
+
+    result = service.decide({
+        "session_id": "live-worker-fallback-test",
+        "engine_snapshot": encode_engine(env.engine),
+        "player_id": actor,
+        "seed": 11,
+        "execute": True,
+    })
+
+    assert result["success"] is True
+    assert result["fallback"] is True
+    assert result["action"] in [action.to_dict() for action in env.legal_actions(actor)]
+    health = service.health()
+    assert health["decision_count"] == 1
+    assert health["fallback_count"] == 1
+    assert "test model failure" in health["last_policy_error"]
 
 
 def test_live_worker_records_an_external_human_decision(tmp_path) -> None:
